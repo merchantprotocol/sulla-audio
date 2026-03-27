@@ -54,6 +54,7 @@ SERVICE_OK=false
 
 # Track whether something was freshly installed (vs already present)
 BLACKHOLE_JUST_INSTALLED=false
+BINARY_UPDATED=false
 
 # ─── Resolve Homebrew under sudo ──────────────────────────────
 # brew is installed per-user and not on root's PATH. We must
@@ -345,6 +346,7 @@ install_binary() {
         cp "$BINARY_SOURCE" "$BINARY_DEST"
         chmod 755 "$BINARY_DEST"
         log "Binary installed."
+        BINARY_UPDATED=true
     fi
 
     # Step C: Verify it's actually there and executable
@@ -447,10 +449,15 @@ ensure_service() {
     fi
 
     # Check if the service is already running and healthy
-    if launchctl print system/"${PLIST_LABEL}" &>/dev/null && [ -S /tmp/audio-driver.sock ]; then
+    # BUT if the binary was just updated, force a restart to pick up the new code
+    if [ "$BINARY_UPDATED" != true ] && launchctl print system/"${PLIST_LABEL}" &>/dev/null && [ -S /tmp/audio-driver.sock ]; then
         log "Service is already running and socket is live."
         SERVICE_OK=true
         return 0
+    fi
+
+    if [ "$BINARY_UPDATED" = true ]; then
+        log "Binary was updated — restarting service to pick up new version..."
     fi
 
     # Write or update the plist
