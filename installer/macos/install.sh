@@ -27,16 +27,17 @@ BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c19
 BINARY_NAME="audio-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLIST_LABEL="com.audiodriver.agent"
-OLD_PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
-# LaunchAgent runs as the user — required for CoreAudio session access
-PLIST_DIR="${REAL_HOME}/Library/LaunchAgents"
-PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
 
 # Resolve the real (non-root) user — critical for brew and config ownership
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(eval echo "~${REAL_USER}")
 REAL_CONFIG="${REAL_HOME}/Library/Application Support/AudioDriver"
+
+PLIST_LABEL="com.audiodriver.agent"
+OLD_PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+# LaunchAgent runs as the user — required for CoreAudio session access
+PLIST_DIR="${REAL_HOME}/Library/LaunchAgents"
+PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
 
 # Colors
 RED='\033[0;31m'
