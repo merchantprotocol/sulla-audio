@@ -6,6 +6,7 @@
 #include <sulla/Logger.h>
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -72,6 +73,9 @@ public:
             serverFd_ = -1;
             return false;
         }
+
+        // Allow non-root processes (Sulla Desktop) to connect
+        ::chmod(socketPath.c_str(), 0777);
 
         if (::listen(serverFd_, 4) < 0) {
             SULLA_LOG_ERROR("Transport", "listen() failed: " + std::string(strerror(errno)));
