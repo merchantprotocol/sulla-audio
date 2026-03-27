@@ -65,6 +65,32 @@ install.sh           Cross-platform install entry point
 docs/                Documentation
 ```
 
+## Platform Status
+
+| Feature | macOS | Windows |
+|---------|-------|---------|
+| Device enumeration | Done (CoreAudio) | Done (WASAPI) |
+| Speaker/system capture | Done (CoreAudio + BlackHole loopback) | Done (WASAPI loopback) |
+| Mic capture (input device) | **Stubbed** — needs input device backend | **Stubbed** — needs input device backend |
+| Audio mirror (dynamic routing) | Done (AudioMirrorManager) | N/A (WASAPI loopback is direct) |
+| Local transport (IPC) | Done (Unix socket) | **Stubbed** — needs named pipe transport |
+| Gateway client (WebSocket) | **Stubbed** — needs websocketpp or similar | **Stubbed** |
+| Auth client (HTTP) | **Stubbed** — needs libcurl or similar | **Stubbed** |
+| Installer / service | Done (LaunchAgent + BlackHole + Multi-Output Device) | Done (install.bat) |
+
+### What's stubbed
+
+**Mic capture**: The driver currently only captures system/speaker audio. Mic capture requires a separate input device backend (`ICaptureBackend` for input devices rather than output loopback). The `DriverController` has the wiring in place but the TODO at line 413 marks where input device selection diverges from output device selection. In local mode, mic audio comes from the desktop app (browser `getUserMedia`), so this is only needed for standalone gateway mode.
+
+**Gateway mode**: `IGatewayClient` and `IAuthClient` factory methods in `PlatformFactory.cpp` return nullptr. Gateway mode (driver authenticates and streams directly to the cloud without Sulla Desktop) requires WebSocket and HTTP client libraries. Local mode is the primary active path.
+
+**Windows named pipe transport**: `ILocalTransport::create()` returns nullptr on Windows. The Unix socket transport works on macOS and Linux. Windows needs a named pipe implementation for local mode IPC with Sulla Desktop.
+
+### What's NOT tested
+
+- **Windows end-to-end**: WASAPI backends are implemented but have not been tested on a Windows machine. The installer (`install.bat`) exists but has not been validated.
+- **Gateway mode**: Cannot be tested until the WebSocket/HTTP client stubs are implemented.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — system design, layers, audio pipeline, concurrency model
