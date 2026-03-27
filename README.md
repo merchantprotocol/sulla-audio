@@ -62,7 +62,16 @@ src/                 Platform backends and CLI entry point
 tests/               GoogleTest unit tests
 installer/           Platform-specific installers
 install.sh           Cross-platform install entry point
+docs/                Documentation
 ```
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md) — system design, layers, audio pipeline, concurrency model
+- [Installation](docs/INSTALLATION.md) — install, uninstall, troubleshooting, service management
+- [Configuration](docs/CONFIGURATION.md) — config file reference, modes, CLI overrides, device selection
+- [Development](docs/DEVELOPMENT.md) — building, testing, project structure, code conventions, stubs
+- [Protocol](docs/PROTOCOL.md) — local socket binary protocol, gateway WebSocket protocol, channel multiplexing
 
 ## License
 

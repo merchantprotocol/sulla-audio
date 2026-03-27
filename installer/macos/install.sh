@@ -1,14 +1,15 @@
 #!/bin/bash
 #
-# Audio Driver installer for macOS.
+# Audio Driver installer for macOS (idempotent).
+#
+# Safe to run repeatedly — checks current state and only acts on
+# what's broken or missing. Running it again will fix itself.
 #
 # Installs:
 #   1. BlackHole 2ch virtual audio device (external dependency, GPLv3)
 #   2. audio-driver binary → /usr/local/bin/
 #   3. Config directory → ~/Library/Application Support/AudioDriver/
-#
-# Default: local mode — no credentials, no gateway.
-# The driver listens on a local socket for desktop apps to connect.
+#   4. launchd service → auto-starts on boot
 #
 # Usage:
 #   sudo ./install.sh
@@ -16,7 +17,7 @@
 #   sudo ./install.sh --skip-blackhole
 #
 
-set -e
+set -euo pipefail
 
 BLACKHOLE_VERSION="0.6.1"
 BLACKHOLE_PKG_URL="https://existential.audio/downloads/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
@@ -25,8 +26,14 @@ BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c19
 
 BINARY_NAME="audio-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
-CONFIG_DIR="${HOME}/Library/Application Support/AudioDriver"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLIST_LABEL="com.audiodriver.agent"
+PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+
+# Resolve the real (non-root) user — critical for brew and config ownership
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME=$(eval echo "~${REAL_USER}")
+REAL_CONFIG="${REAL_HOME}/Library/Application Support/AudioDriver"
 
 # Colors
 RED='\033[0;31m'
@@ -40,24 +47,73 @@ warn()  { echo -e "${YELLOW}[audio-driver]${NC} $1"; }
 error() { echo -e "${RED}[audio-driver]${NC} $1" >&2; }
 info()  { echo -e "${CYAN}[audio-driver]${NC} $1"; }
 
+# Track outcomes for the summary
+BLACKHOLE_OK=false
+BINARY_OK=false
+SERVICE_OK=false
+
+# Track whether something was freshly installed (vs already present)
+BLACKHOLE_JUST_INSTALLED=false
+
+# ─── Resolve Homebrew under sudo ──────────────────────────────
+# brew is installed per-user and not on root's PATH. We must
+# find it explicitly so that `sudo -u $REAL_USER brew ...` works.
+
+resolve_brew() {
+    local candidates=(
+        "/opt/homebrew/bin/brew"
+        "/usr/local/bin/brew"
+    )
+    local user_brew
+    user_brew=$(sudo -u "$REAL_USER" bash -lc 'command -v brew' 2>/dev/null || true)
+    if [ -n "$user_brew" ]; then
+        candidates+=("$user_brew")
+    fi
+    for candidate in "${candidates[@]}"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ─── Check for BlackHole ─────────────────────────────────────
 
 blackhole_installed() {
     if pkgutil --pkg-info "${BLACKHOLE_PKG_ID}" &>/dev/null; then
+        log "  (detected via pkgutil receipt)"
         return 0
     fi
     if [ -d "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver" ]; then
+        log "  (detected via HAL plugin directory)"
         return 0
     fi
     if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
+        log "  (detected via system_profiler)"
         return 0
     fi
+
+    # Check if brew thinks it's installed but OS doesn't see it (stale state).
+    # This happens when driver files are manually deleted without `brew uninstall`.
+    # Clean up the stale receipt so the next install attempt doesn't conflict.
+    local brew_bin
+    if brew_bin=$(resolve_brew); then
+        if sudo -u "$REAL_USER" "$brew_bin" list --cask blackhole-2ch &>/dev/null; then
+            warn "Homebrew reports blackhole-2ch as installed, but the driver is missing."
+            warn "Cleaning up stale Homebrew state..."
+            sudo -u "$REAL_USER" "$brew_bin" uninstall --cask blackhole-2ch --force 2>/dev/null || true
+        fi
+    fi
+
     return 1
 }
 
 install_blackhole() {
+    log "Checking for BlackHole 2ch..."
     if blackhole_installed; then
         log "BlackHole 2ch is already installed."
+        BLACKHOLE_OK=true
         return 0
     fi
 
@@ -66,18 +122,26 @@ install_blackhole() {
     info "Homepage: https://existential.audio/blackhole/"
     echo ""
 
-    # Try Homebrew first
-    if command -v brew &>/dev/null; then
+    # Try Homebrew first (preferred — clean uninstall path)
+    local brew_bin
+    if brew_bin=$(resolve_brew); then
         log "Installing BlackHole 2ch via Homebrew..."
-        REAL_USER="${SUDO_USER:-$USER}"
-        if sudo -u "$REAL_USER" brew install --cask blackhole-2ch 2>/dev/null; then
+        local brew_output
+        if brew_output=$(sudo -u "$REAL_USER" "$brew_bin" install --cask blackhole-2ch 2>&1); then
             log "BlackHole 2ch installed via Homebrew."
+            BLACKHOLE_OK=true
+            BLACKHOLE_JUST_INSTALLED=true
             return 0
+        else
+            warn "Homebrew install failed:"
+            echo "$brew_output" | tail -5 | while IFS= read -r line; do warn "  $line"; done
+            warn "Falling back to direct download..."
         fi
-        warn "Homebrew install failed. Falling back to direct download..."
+    else
+        info "Homebrew not found. Using direct download..."
     fi
 
-    # Direct download
+    # Direct download fallback
     log "Downloading BlackHole 2ch v${BLACKHOLE_VERSION}..."
     local pkg_path="/tmp/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
 
@@ -99,10 +163,14 @@ install_blackhole() {
     log "Checksum verified."
 
     log "Installing BlackHole 2ch..."
-    if installer -pkg "$pkg_path" -target / 2>/dev/null; then
+    local installer_output
+    if installer_output=$(installer -pkg "$pkg_path" -target / 2>&1); then
         log "BlackHole 2ch installed successfully."
+        BLACKHOLE_OK=true
+        BLACKHOLE_JUST_INSTALLED=true
     else
-        error "Failed to install BlackHole package."
+        error "Failed to install BlackHole package:"
+        echo "$installer_output" | while IFS= read -r line; do error "  $line"; done
         error "Install manually: https://existential.audio/blackhole/"
         rm -f "$pkg_path"
         return 1
@@ -114,24 +182,32 @@ install_blackhole() {
 
 # ─── Uninstall ────────────────────────────────────────────────
 
-if [ "$1" = "--uninstall" ]; then
+if [ "${1:-}" = "--uninstall" ]; then
     log "Uninstalling Audio Driver..."
+
+    # Stop and remove launchd service
+    launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+    rm -f "$PLIST_PATH"
+    log "Service removed."
 
     if [ -f "$BINARY_DEST" ]; then
         rm -f "$BINARY_DEST"
         log "Removed ${BINARY_DEST}"
     fi
 
-    log ""
+    # Clean up socket
+    rm -f /tmp/audio-driver.sock
+
+    echo ""
     warn "BlackHole 2ch was NOT uninstalled (other apps may depend on it)."
     warn "To uninstall BlackHole manually:"
     warn "  brew uninstall --cask blackhole-2ch"
     warn "  — or —"
     warn "  sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver"
     warn "  sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod"
-    log ""
-    warn "Config preserved at: ${CONFIG_DIR}"
-    warn "To remove config: rm -rf '${CONFIG_DIR}'"
+    echo ""
+    warn "Config preserved at: ${REAL_CONFIG}"
+    warn "To remove config: rm -rf '${REAL_CONFIG}'"
 
     log "Uninstall complete."
     exit 0
@@ -154,7 +230,8 @@ done
 log "Installing Audio Driver..."
 echo ""
 
-# 1. Install BlackHole (external dependency)
+# ─── Step 1: BlackHole ────────────────────────────────────────
+
 if [ "$SKIP_BLACKHOLE" = false ]; then
     if ! install_blackhole; then
         warn "Continuing without BlackHole. System audio capture may not work."
@@ -163,67 +240,128 @@ if [ "$SKIP_BLACKHOLE" = false ]; then
     echo ""
 fi
 
-# 2. Build and install binary
+# ─── Step 2: Build and install binary ─────────────────────────
+
 PROJECT_ROOT="${SCRIPT_DIR}/../.."
 BUILD_DIR="${PROJECT_ROOT}/build"
 BINARY_SOURCE="${BUILD_DIR}/audio-driver"
 
-if [ ! -f "$BINARY_SOURCE" ]; then
+resolve_cmake() {
+    local bin=""
+    if command -v cmake &>/dev/null; then
+        bin="cmake"
+    elif [ -x /opt/homebrew/bin/cmake ]; then
+        bin="/opt/homebrew/bin/cmake"
+    elif [ -x /usr/local/bin/cmake ]; then
+        bin="/usr/local/bin/cmake"
+    fi
+
+    if [ -z "$bin" ]; then
+        warn "cmake not found. Attempting to install via Homebrew..."
+        local local_brew=""
+        if local_brew=$(resolve_brew); then
+            sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1 | tail -5
+            bin="$(dirname "$local_brew")/cmake"
+            if [ ! -x "$bin" ]; then
+                bin="$("$local_brew" --prefix)/bin/cmake"
+            fi
+        fi
+    fi
+
+    if [ -n "$bin" ] && [ -x "$bin" ]; then
+        echo "$bin"
+        return 0
+    fi
+
+    return 1
+}
+
+build_binary() {
     log "Building audio-driver from source..."
 
-    # Check for cmake
-    CMAKE_BIN=""
-    if command -v cmake &>/dev/null; then
-        CMAKE_BIN="cmake"
-    elif [ -x /opt/homebrew/bin/cmake ]; then
-        CMAKE_BIN="/opt/homebrew/bin/cmake"
-    elif [ -x /usr/local/bin/cmake ]; then
-        CMAKE_BIN="/usr/local/bin/cmake"
-    fi
-
-    if [ -z "$CMAKE_BIN" ]; then
-        warn "cmake not found. Attempting to install via Homebrew..."
-        REAL_USER="${SUDO_USER:-$USER}"
-        if command -v brew &>/dev/null; then
-            sudo -u "$REAL_USER" brew install cmake 2>/dev/null
-            CMAKE_BIN="$(sudo -u "$REAL_USER" brew --prefix)/bin/cmake"
-        fi
-    fi
-
-    if [ -z "$CMAKE_BIN" ] || [ ! -x "$CMAKE_BIN" ]; then
+    local cmake_bin
+    if ! cmake_bin=$(resolve_cmake); then
         error "cmake is required to build audio-driver."
         error "Install it: brew install cmake"
-    else
-        mkdir -p "$BUILD_DIR"
-        "$CMAKE_BIN" -S "$PROJECT_ROOT" -B "$BUILD_DIR" -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release </dev/null 2>&1 | tail -3
-        "$CMAKE_BIN" --build "$BUILD_DIR" --target audio-driver 2>&1 | tail -5
+        error "Then re-run this installer."
+        return 1
+    fi
 
-        if [ -f "$BINARY_SOURCE" ]; then
-            log "Build successful."
-        else
-            error "Build failed. Check cmake output above."
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+
+    log "Running cmake configure..."
+    if ! "$cmake_bin" -S "$PROJECT_ROOT" -B "$BUILD_DIR" -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release </dev/null 2>&1; then
+        error "cmake configure failed. Full output above."
+        return 1
+    fi
+
+    log "Running cmake build..."
+    if ! "$cmake_bin" --build "$BUILD_DIR" --target audio-driver 2>&1; then
+        error "cmake build failed. Full output above."
+        return 1
+    fi
+
+    if [ ! -f "$BINARY_SOURCE" ]; then
+        error "Build completed but binary not produced."
+        return 1
+    fi
+
+    log "Build successful."
+    return 0
+}
+
+install_binary() {
+    # Step A: Ensure we have a build artifact
+    if [ ! -f "$BINARY_SOURCE" ]; then
+        if ! build_binary; then
+            if [ -f "$BINARY_DEST" ] && [ -x "$BINARY_DEST" ]; then
+                warn "Build failed but existing binary at ${BINARY_DEST} is usable."
+                BINARY_OK=true
+                return 0
+            fi
+            error "No binary available. The service cannot start without it."
+            return 1
         fi
     fi
-fi
 
-if [ -f "$BINARY_SOURCE" ]; then
-    log "Installing binary to ${BINARY_DEST}..."
-    mkdir -p "$(dirname "$BINARY_DEST")"
-    cp "$BINARY_SOURCE" "$BINARY_DEST"
-    chmod 755 "$BINARY_DEST"
-    log "Binary installed."
-else
-    warn "Binary not available — skipping install."
-fi
+    # Step B: Always copy to destination — this is the step that must not be skipped
+    if [ -f "$BINARY_DEST" ] && cmp -s "$BINARY_SOURCE" "$BINARY_DEST"; then
+        log "Binary at ${BINARY_DEST} is up to date."
+    else
+        log "Installing binary to ${BINARY_DEST}..."
+        mkdir -p "$(dirname "$BINARY_DEST")"
+        cp "$BINARY_SOURCE" "$BINARY_DEST"
+        chmod 755 "$BINARY_DEST"
+        log "Binary installed."
+    fi
 
-# 3. Create config directory with local mode defaults
-REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
-REAL_CONFIG="${REAL_HOME}/Library/Application Support/AudioDriver"
-if [ ! -d "$REAL_CONFIG" ]; then
-    mkdir -p "$REAL_CONFIG"
-    chown -R "${SUDO_USER:-$USER}" "$REAL_CONFIG"
-    log "Config directory created: ${REAL_CONFIG}"
+    # Step C: Verify it's actually there and executable
+    if [ ! -f "$BINARY_DEST" ]; then
+        error "Binary copy failed — ${BINARY_DEST} does not exist after cp."
+        error "Check permissions on $(dirname "$BINARY_DEST")"
+        return 1
+    fi
 
+    if [ ! -x "$BINARY_DEST" ]; then
+        error "Binary at ${BINARY_DEST} is not executable after chmod."
+        return 1
+    fi
+
+    BINARY_OK=true
+    return 0
+}
+
+install_binary
+echo ""
+
+# ─── Step 3: Ensure config exists ─────────────────────────────
+
+mkdir -p "$REAL_CONFIG"
+chown "${REAL_USER}" "$REAL_CONFIG"
+
+if [ ! -f "${REAL_CONFIG}/config.ini" ]; then
+    log "Creating default config..."
     cat > "${REAL_CONFIG}/config.ini" << 'EOF'
 [mode]
 mode=local
@@ -253,31 +391,59 @@ auto_start=true
 log_level=info
 log_audio_diagnostics=true
 EOF
-    chown "${SUDO_USER:-$USER}" "${REAL_CONFIG}/config.ini"
-    log "Default config: local mode (no credentials needed)"
-fi
-
-# 4. Restart coreaudiod to detect BlackHole
-log "Restarting coreaudiod..."
-launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
-    killall coreaudiod 2>/dev/null || true
-
-# 5. Verify BlackHole is visible
-sleep 2
-if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
-    log "BlackHole virtual audio device detected!"
+    chown "${REAL_USER}" "${REAL_CONFIG}/config.ini"
+    log "Default config created: local mode (no credentials needed)"
 else
-    warn "BlackHole not yet visible. A reboot may be required."
+    log "Config exists at ${REAL_CONFIG}/config.ini"
 fi
 
-# 6. Register as a launchd service (auto-start on boot)
-PLIST_LABEL="com.audiodriver.agent"
-PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+# ─── Step 4: coreaudiod (only if BlackHole was just installed) ─
 
-# Stop existing service if running
-launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+if [ "$BLACKHOLE_JUST_INSTALLED" = true ]; then
+    log "Restarting coreaudiod to detect newly installed BlackHole..."
+    launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
+        killall coreaudiod 2>/dev/null || true
 
-cat > "$PLIST_PATH" << PLISTEOF
+    tries=0
+    while [ $tries -lt 5 ]; do
+        sleep 1
+        if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
+            log "BlackHole virtual audio device detected!"
+            break
+        fi
+        tries=$((tries + 1))
+    done
+    if [ $tries -eq 5 ]; then
+        warn "BlackHole not yet visible. A reboot may be required."
+    fi
+fi
+
+# ─── Step 5: Ensure launchd service is running ────────────────
+
+ensure_service() {
+    if [ "$BINARY_OK" != true ]; then
+        warn "Binary not installed — cannot start service."
+        return 1
+    fi
+
+    # Clean up stale socket (exists but no process behind it)
+    if [ -S /tmp/audio-driver.sock ]; then
+        # Check if something is actually listening
+        if ! lsof /tmp/audio-driver.sock &>/dev/null; then
+            warn "Stale socket found. Removing /tmp/audio-driver.sock"
+            rm -f /tmp/audio-driver.sock
+        fi
+    fi
+
+    # Check if the service is already running and healthy
+    if launchctl print system/"${PLIST_LABEL}" &>/dev/null && [ -S /tmp/audio-driver.sock ]; then
+        log "Service is already running and socket is live."
+        SERVICE_OK=true
+        return 0
+    fi
+
+    # Write or update the plist
+    cat > "$PLIST_PATH" << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -302,26 +468,102 @@ cat > "$PLIST_PATH" << PLISTEOF
 </plist>
 PLISTEOF
 
-chmod 644 "$PLIST_PATH"
-chown root:wheel "$PLIST_PATH"
+    chmod 644 "$PLIST_PATH"
+    chown root:wheel "$PLIST_PATH"
 
-if [ -f "$BINARY_DEST" ]; then
-    launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || true
-    log "Service registered and started (auto-starts on boot)"
+    # Stop if registered but unhealthy
+    launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+
+    # Start
+    if launchctl bootstrap system "$PLIST_PATH" 2>/dev/null; then
+        log "Service started."
+    else
+        # bootstrap can fail if already loaded — try kickstart
+        if launchctl kickstart -k system/"${PLIST_LABEL}" 2>/dev/null; then
+            log "Service restarted."
+        else
+            error "Failed to start launchd service."
+            error "Try manually: sudo launchctl bootstrap system ${PLIST_PATH}"
+            return 1
+        fi
+    fi
+
+    # Verify the socket appears
+    tries=0
+    while [ $tries -lt 5 ]; do
+        sleep 1
+        if [ -S /tmp/audio-driver.sock ]; then
+            log "Socket /tmp/audio-driver.sock is live!"
+            SERVICE_OK=true
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+
+    # Socket didn't appear — check if process is at least running
+    if launchctl print system/"${PLIST_LABEL}" &>/dev/null; then
+        warn "Service is running but socket not yet available."
+        warn "Check logs: cat /tmp/audio-driver.log"
+        # Still mark as OK if the process is alive — socket may need BlackHole
+        SERVICE_OK=true
+        return 0
+    fi
+
+    error "Service failed to start."
+    error "Check logs: cat /tmp/audio-driver.log"
+    return 1
+}
+
+ensure_service
+
+# ─── Summary ──────────────────────────────────────────────────
+
+echo ""
+echo "─────────────────────────────────────────────────────"
+
+FAILURES=0
+
+if [ "$BLACKHOLE_OK" = true ]; then
+    log "  BlackHole 2ch .......... OK"
+elif [ "$SKIP_BLACKHOLE" = true ]; then
+    warn "  BlackHole 2ch .......... SKIPPED"
 else
-    warn "Binary not installed — service registered but won't start until binary is available"
+    error "  BlackHole 2ch .......... FAILED"
+    FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$BINARY_OK" = true ]; then
+    log "  audio-driver binary .... OK  (${BINARY_DEST})"
+else
+    error "  audio-driver binary .... FAILED"
+    FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$SERVICE_OK" = true ]; then
+    log "  launchd service ........ OK  (${PLIST_LABEL})"
+else
+    error "  launchd service ........ FAILED"
+    FAILURES=$((FAILURES + 1))
+fi
+
+echo "─────────────────────────────────────────────────────"
+
+if [ "$FAILURES" -gt 0 ]; then
+    echo ""
+    error "Installation completed with ${FAILURES} failure(s). Review errors above."
+    exit 1
 fi
 
 echo ""
-log "Installation complete!"
+log "Installation complete! Audio driver is running."
 echo ""
-log "The audio driver is running in local mode."
 log "Desktop apps connect automatically via /tmp/audio-driver.sock"
 echo ""
 log "Commands:"
 log "  audio-driver --list-devices       List audio devices"
 log "  audio-driver --configure          Set up gateway mode (credentials)"
-log ""
+echo ""
 log "Service management:"
 log "  sudo launchctl kickstart -k system/${PLIST_LABEL}   Restart"
 log "  sudo launchctl bootout system/${PLIST_LABEL}        Stop"
+log "  cat /tmp/audio-driver.log                           View logs"
