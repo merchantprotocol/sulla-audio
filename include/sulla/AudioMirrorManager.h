@@ -248,19 +248,31 @@ private:
                 rebuilding_ = false;
                 return false;
             }
-            // Make sure it's not already our mirror
+            // Make sure it's not already our mirror or BlackHole
             std::string uid = getDeviceUID(physicalOutput);
             if (uid == kMirrorUID) {
-                // Mirror already exists and is default — adopt it
-                AudioDeviceID existing = findDeviceByUID(kMirrorUID);
-                if (existing != kAudioObjectUnknown) {
-                    mirrorId_ = existing;
-                    SULLA_LOG_INFO("Mirror", "Adopted existing mirror device (ID: " + std::to_string(mirrorId_) + ")");
+                // Default output is already our mirror — destroy it and rebuild
+                // so we pick up any configuration changes (e.g. master sub-device).
+                // Extract the physical sub-device first so we know what to mirror.
+                AudioDeviceID existingMirror = findDeviceByUID(kMirrorUID);
+                AudioDeviceID physicalSub = getFirstNonBlackholeSubDevice(existingMirror);
+                if (physicalSub != kAudioObjectUnknown) {
+                    lastPhysicalOutput_ = physicalSub;
+                    physicalOutput = physicalSub;
+                    SULLA_LOG_INFO("Mirror", "Existing mirror found — rebuilding with physical device: " + getDeviceName(physicalSub));
+                } else {
+                    // Can't determine physical sub-device, find a fallback
+                    physicalOutput = findFallbackOutputDevice();
+                    if (physicalOutput == kAudioObjectUnknown) {
+                        SULLA_LOG_WARN("Mirror", "Cannot determine physical output — adopting existing mirror");
+                        mirrorId_ = existingMirror;
+                        rebuilding_ = false;
+                        return true;
+                    }
+                    lastPhysicalOutput_ = physicalOutput;
                 }
-                rebuilding_ = false;
-                return true;
-            }
-            if (uid == kBlackHoleUID) {
+                // Fall through to destroy + recreate below
+            } else if (uid == kBlackHoleUID) {
                 rebuilding_ = false;
                 return false;
             }
@@ -429,6 +441,36 @@ private:
         CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8);
         CFRelease(name);
         return std::string(buf);
+    }
+
+    /**
+     * Given an aggregate device, find its first sub-device that isn't BlackHole.
+     * Used to recover the physical output device from an existing mirror.
+     */
+    static AudioDeviceID getFirstNonBlackholeSubDevice(AudioDeviceID aggregateDevice) {
+        if (aggregateDevice == kAudioObjectUnknown) return kAudioObjectUnknown;
+
+        AudioObjectPropertyAddress addr = {
+            kAudioAggregateDevicePropertyActiveSubDeviceList,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 size = 0;
+        OSStatus status = AudioObjectGetPropertyDataSize(aggregateDevice, &addr, 0, nullptr, &size);
+        if (status != noErr || size == 0) return kAudioObjectUnknown;
+
+        int count = size / sizeof(AudioDeviceID);
+        std::vector<AudioDeviceID> subDevices(count);
+        status = AudioObjectGetPropertyData(aggregateDevice, &addr, 0, nullptr, &size, subDevices.data());
+        if (status != noErr) return kAudioObjectUnknown;
+
+        for (auto sub : subDevices) {
+            std::string uid = getDeviceUID(sub);
+            if (uid != kBlackHoleUID && uid != kMirrorUID && !uid.empty()) {
+                return sub;
+            }
+        }
+        return kAudioObjectUnknown;
     }
 
     static AudioDeviceID findDeviceByUID(const char* targetUID) {
