@@ -259,17 +259,16 @@ int runDriver(sulla::DriverConfig& config) {
 // ─── Entry point ─────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    auto config = loadConfig();
-
+    // Handle info-only flags before loading config or touching any resources
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--list-devices" || arg == "-l") {
-            listDevices();
-            return 0;
-        }
         if (arg == "--version" || arg == "-v") {
             std::cout << "audio-driver v" << AUDIO_DRIVER_VERSION
                       << " (" << AUDIO_DRIVER_COMMIT << ", " << AUDIO_DRIVER_BUILD_DATE << ")\n";
+            return 0;
+        }
+        if (arg == "--list-devices" || arg == "-l") {
+            listDevices();
             return 0;
         }
         if (arg == "--help" || arg == "-h") {
@@ -293,6 +292,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    auto config = loadConfig();
     configure(config, argc, argv);
     return runDriver(config);
 }
