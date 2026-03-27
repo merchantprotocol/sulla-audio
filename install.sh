@@ -2,7 +2,8 @@
 #
 # SullaAudio cross-platform installer.
 #
-# Detects the OS and runs the appropriate platform installer.
+# Clones the repo to a temp directory, detects the OS,
+# and runs the appropriate platform installer.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main/install.sh | sudo bash
@@ -15,7 +16,8 @@
 
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main"
+REPO_URL="https://github.com/merchantprotocol/sulla-audio.git"
+CLONE_DIR="/tmp/sulla-audio-installer"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,15 +26,12 @@ NC='\033[0m'
 log()   { echo -e "${GREEN}[sulla-audio]${NC} $1"; }
 error() { echo -e "${RED}[sulla-audio]${NC} $1" >&2; }
 
-fetch_and_run() {
-    local url="$1"
-    shift
-    local script
-    script=$(curl -fsSL "$url") || {
-        error "Failed to download: ${url}"
-        exit 1
-    }
-    bash -c "$script" -- "$@"
+# Clone the repo
+log "Downloading sulla-audio..."
+rm -rf "$CLONE_DIR"
+git clone --depth 1 "$REPO_URL" "$CLONE_DIR" 2>/dev/null || {
+    error "Failed to clone ${REPO_URL}"
+    exit 1
 }
 
 OS="$(uname -s)"
@@ -40,18 +39,20 @@ OS="$(uname -s)"
 case "$OS" in
     Darwin)
         log "Detected macOS"
-        fetch_and_run "${REPO_RAW}/installer/macos/install.sh" "$@"
+        exec bash "${CLONE_DIR}/installer/macos/install.sh" "$@"
         ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
         log "Detected Windows"
-        fetch_and_run "${REPO_RAW}/installer/windows/install.sh" "$@"
+        exec cmd.exe /c "${CLONE_DIR}\\installer\\windows\\install.bat" "$@"
         ;;
     Linux)
         error "Linux is not currently supported."
+        rm -rf "$CLONE_DIR"
         exit 1
         ;;
     *)
         error "Unknown OS: ${OS}"
+        rm -rf "$CLONE_DIR"
         exit 1
         ;;
 esac
