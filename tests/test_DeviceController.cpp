@@ -74,7 +74,7 @@ TEST(DeviceController, ListAllDevices) {
     mock->devices = {
         makeDevice("dev-1", "Speakers"),
         makeDevice("dev-2", "Headphones"),
-        makeDevice("dev-3", "BlackHole 2ch", false, true),
+        makeDevice("dev-3", "SullaLoopback 2ch", false, true),
     };
 
     DeviceController ctrl(std::move(mock));

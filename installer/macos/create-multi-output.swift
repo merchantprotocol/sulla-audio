@@ -1,8 +1,8 @@
 #!/usr/bin/env swift
 //
 // create-multi-output — creates a Multi-Output Device combining
-// the default output device with BlackHole 2ch, then sets it as
-// the system default output so all audio mirrors to BlackHole.
+// the default output device with SullaLoopback, then sets it as
+// the system default output so all audio mirrors to the loopback driver.
 //
 // Usage:
 //   swift create-multi-output.swift          # create + set default
@@ -15,7 +15,7 @@ import Foundation
 
 let kDeviceName = "Sulla Audio Mirror"
 let kDeviceUID  = "SullaAudioMirror_UID"
-let kBlackHoleUID = "BlackHole2ch_UID"
+let kLoopbackUID = "SullaLoopback2ch_UID"
 
 // MARK: - Helpers
 
@@ -106,9 +106,9 @@ func createMultiOutput() -> Bool {
         return false
     }
 
-    // Don't create if default is already BlackHole (would create a loop)
-    if defaultUID == kBlackHoleUID {
-        fputs("Error: default output is already BlackHole. Set a physical output device first.\n", stderr)
+    // Don't create if default is already the loopback driver (would create a loop)
+    if defaultUID == kLoopbackUID {
+        fputs("Error: default output is already SullaLoopback. Set a physical output device first.\n", stderr)
         return false
     }
 
@@ -118,14 +118,14 @@ func createMultiOutput() -> Bool {
         return true
     }
 
-    // Verify BlackHole exists
-    guard findDeviceByUID(kBlackHoleUID) != nil else {
-        fputs("Error: BlackHole 2ch not found. Install it first.\n", stderr)
+    // Verify loopback driver exists
+    guard findDeviceByUID(kLoopbackUID) != nil else {
+        fputs("Error: SullaLoopback not found. Install it first.\n", stderr)
         return false
     }
 
     // Create the aggregate device description
-    // Main device = physical output (speakers), sub-device = BlackHole
+    // Main device = physical output (speakers), sub-device = loopback driver
     // kAudioAggregateDeviceIsStackedKey = 1 makes it Multi-Output (stacked)
     let description: [String: Any] = [
         kAudioAggregateDeviceNameKey as String: kDeviceName,
@@ -133,7 +133,7 @@ func createMultiOutput() -> Bool {
         kAudioAggregateDeviceIsStackedKey as String: 1 as UInt32,
         kAudioAggregateDeviceSubDeviceListKey as String: [
             [kAudioSubDeviceUIDKey as String: defaultUID],
-            [kAudioSubDeviceUIDKey as String: kBlackHoleUID],
+            [kAudioSubDeviceUIDKey as String: kLoopbackUID],
         ]
     ]
 
@@ -189,7 +189,7 @@ func removeMultiOutput() -> Bool {
             var uidSize = UInt32(MemoryLayout<CFString>.size)
             AudioObjectGetPropertyData(dev, &uidAddr, 0, nil, &uidSize, &uid)
             let uidStr = uid as String
-            if uidStr != kDeviceUID && uidStr != kBlackHoleUID && !uidStr.isEmpty {
+            if uidStr != kDeviceUID && uidStr != kLoopbackUID && !uidStr.isEmpty {
                 // Check it has output channels
                 var outputAddr = AudioObjectPropertyAddress(
                     mSelector: kAudioDevicePropertyStreamConfiguration,

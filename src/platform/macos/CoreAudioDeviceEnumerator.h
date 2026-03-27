@@ -17,7 +17,7 @@ namespace sulla {
  * CoreAudioDeviceEnumerator — lists audio devices via macOS CoreAudio.
  *
  * Thin wrapper around AudioObjectGetPropertyData.
- * On macOS, only virtual audio devices (BlackHole, AudioDriver) support
+ * On macOS, only virtual audio devices (SullaLoopback, BlackHole, etc.) support
  * loopback capture — this enumerator marks them accordingly.
  */
 class CoreAudioDeviceEnumerator : public IDeviceEnumerator {
@@ -155,6 +155,7 @@ private:
     bool isVirtualDevice(const std::string& name) {
         // Same patterns as SecretaryModeController's virtualPatterns
         static const char* patterns[] = {
+            "SullaLoopback", "sullaloopback",
             "BlackHole", "blackhole",
             "Loopback",
             "AudioDriver", "Audio Driver", "audio-driver",

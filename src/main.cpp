@@ -128,7 +128,7 @@ void listDevices() {
         }
         if (!hasVirtual) {
             std::cout << "  No virtual audio device found.\n"
-                      << "  Install BlackHole.driver or BlackHole for loopback capture.\n\n";
+                      << "  Run the installer to build the SullaLoopback driver for loopback capture.\n\n";
         }
     }
 }

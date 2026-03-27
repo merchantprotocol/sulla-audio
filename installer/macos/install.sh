@@ -5,8 +5,11 @@
 # Safe to run repeatedly — checks current state and only acts on
 # what's broken or missing. Running it again will fix itself.
 #
+# Downloads pre-built binaries from GitHub Releases. Falls back to
+# building from source if the download fails (requires Xcode + cmake).
+#
 # Installs:
-#   1. BlackHole 2ch virtual audio device (external dependency, GPLv3)
+#   1. SullaLoopback virtual audio device (hidden from System Settings)
 #   2. audio-driver binary → /usr/local/bin/
 #   3. Config directory → ~/Library/Application Support/AudioDriver/
 #   4. launchd service → auto-starts on boot
@@ -14,15 +17,15 @@
 # Usage:
 #   sudo ./install.sh
 #   sudo ./install.sh --uninstall
-#   sudo ./install.sh --skip-blackhole
+#   sudo ./install.sh --skip-loopback
+#   sudo ./install.sh --from-source      # force build from source
 #
 
 set -euo pipefail
 
-BLACKHOLE_VERSION="0.6.1"
-BLACKHOLE_PKG_URL="https://existential.audio/downloads/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
-BLACKHOLE_PKG_ID="audio.existential.BlackHole2ch"
-BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c1988"
+GITHUB_REPO="merchantprotocol/sulla-audio"
+LOOPBACK_DRIVER_NAME="SullaLoopback2ch"
+LOOPBACK_HAL_PATH="/Library/Audio/Plug-Ins/HAL/${LOOPBACK_DRIVER_NAME}.driver"
 
 BINARY_NAME="audio-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
@@ -52,17 +55,65 @@ error() { echo -e "${RED}[audio-driver]${NC} $1" >&2; }
 info()  { echo -e "${CYAN}[audio-driver]${NC} $1"; }
 
 # Track outcomes for the summary
-BLACKHOLE_OK=false
+LOOPBACK_OK=false
 BINARY_OK=false
 SERVICE_OK=false
 
 # Track whether something was freshly installed (vs already present)
-BLACKHOLE_JUST_INSTALLED=false
+LOOPBACK_JUST_INSTALLED=false
 BINARY_UPDATED=false
 
+# ─── GitHub Release helpers ──────────────────────────────────
+
+# Fetch the download URL for an asset from the latest GitHub Release.
+# Usage: get_release_asset_url <asset-name-pattern>
+get_release_asset_url() {
+    local pattern="$1"
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local release_json
+
+    release_json=$(curl -fsSL "$api_url" 2>/dev/null) || return 1
+
+    # Extract the browser_download_url matching the pattern
+    echo "$release_json" \
+        | grep -o '"browser_download_url": *"[^"]*'"$pattern"'[^"]*"' \
+        | head -1 \
+        | sed 's/"browser_download_url": *"//' \
+        | sed 's/"$//'
+}
+
+# Download a file, verify with companion .sha256 if available.
+# Usage: download_and_verify <url> <dest-path>
+download_and_verify() {
+    local url="$1"
+    local dest="$2"
+
+    if ! curl -fSL -o "$dest" "$url"; then
+        return 1
+    fi
+
+    # Try to verify checksum
+    local sha_url="${url}.sha256"
+    local sha_file="${dest}.sha256"
+    if curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
+        local expected actual
+        expected=$(awk '{print $1}' "$sha_file")
+        actual=$(shasum -a 256 "$dest" | awk '{print $1}')
+        rm -f "$sha_file"
+        if [ "$expected" != "$actual" ]; then
+            error "Checksum mismatch!"
+            error "Expected: ${expected}"
+            error "Got:      ${actual}"
+            rm -f "$dest"
+            return 1
+        fi
+        log "Checksum verified."
+    fi
+
+    return 0
+}
+
 # ─── Resolve Homebrew under sudo ──────────────────────────────
-# brew is installed per-user and not on root's PATH. We must
-# find it explicitly so that `sudo -u $REAL_USER brew ...` works.
 
 resolve_brew() {
     local candidates=(
@@ -83,105 +134,254 @@ resolve_brew() {
     return 1
 }
 
-# ─── Check for BlackHole ─────────────────────────────────────
+# ─── SullaLoopback driver ───────────────────────────────────
 
-blackhole_installed() {
-    if pkgutil --pkg-info "${BLACKHOLE_PKG_ID}" &>/dev/null; then
-        log "  (detected via pkgutil receipt)"
-        return 0
-    fi
-    if [ -d "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver" ]; then
+loopback_installed() {
+    if [ -d "$LOOPBACK_HAL_PATH" ]; then
         log "  (detected via HAL plugin directory)"
         return 0
     fi
-    if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
+    if system_profiler SPAudioDataType 2>/dev/null | grep -qi "SullaLoopback"; then
         log "  (detected via system_profiler)"
         return 0
     fi
+    return 1
+}
 
-    # Check if brew thinks it's installed but OS doesn't see it (stale state).
-    # This happens when driver files are manually deleted without `brew uninstall`.
-    # Clean up the stale receipt so the next install attempt doesn't conflict.
-    local brew_bin
-    if brew_bin=$(resolve_brew); then
-        if sudo -u "$REAL_USER" "$brew_bin" list --cask blackhole-2ch &>/dev/null; then
-            warn "Homebrew reports blackhole-2ch as installed, but the driver is missing."
-            warn "Cleaning up stale Homebrew state..."
-            sudo -u "$REAL_USER" "$brew_bin" uninstall --cask blackhole-2ch --force 2>/dev/null || true
+install_loopback_from_release() {
+    log "Downloading pre-built SullaLoopback driver..."
+
+    local url
+    url=$(get_release_asset_url "${LOOPBACK_DRIVER_NAME}.driver.tar.gz") || return 1
+    if [ -z "$url" ]; then return 1; fi
+
+    local tmp_tar="/tmp/${LOOPBACK_DRIVER_NAME}.driver.tar.gz"
+    if ! download_and_verify "$url" "$tmp_tar"; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+
+    # Extract to HAL directory
+    if [ -d "$LOOPBACK_HAL_PATH" ]; then
+        rm -rf "$LOOPBACK_HAL_PATH"
+    fi
+
+    tar xzf "$tmp_tar" -C /Library/Audio/Plug-Ins/HAL/
+    rm -f "$tmp_tar"
+
+    if [ ! -d "$LOOPBACK_HAL_PATH" ]; then
+        error "Extraction succeeded but driver bundle not found."
+        return 1
+    fi
+
+    chmod -R 755 "$LOOPBACK_HAL_PATH"
+    log "SullaLoopback driver installed from release."
+    return 0
+}
+
+install_loopback_from_source() {
+    local build_script="${SCRIPT_DIR}/build-loopback-driver.sh"
+    if [ ! -f "$build_script" ]; then
+        error "build-loopback-driver.sh not found — cannot build from source."
+        return 1
+    fi
+
+    log "Building SullaLoopback driver from source..."
+    if bash "$build_script" install 2>&1; then
+        log "SullaLoopback driver built and installed."
+        return 0
+    else
+        error "Source build failed. Ensure Xcode CLI tools: xcode-select --install"
+        return 1
+    fi
+}
+
+install_loopback() {
+    log "Checking for SullaLoopback driver..."
+    if loopback_installed; then
+        log "SullaLoopback driver is already installed."
+        LOOPBACK_OK=true
+        return 0
+    fi
+
+    info "SullaLoopback is required for system audio loopback on macOS."
+    echo ""
+
+    if [ "$FROM_SOURCE" = false ]; then
+        if install_loopback_from_release; then
+            LOOPBACK_OK=true
+            LOOPBACK_JUST_INSTALLED=true
+            return 0
+        fi
+        warn "Pre-built download unavailable. Falling back to source build..."
+    fi
+
+    if install_loopback_from_source; then
+        LOOPBACK_OK=true
+        LOOPBACK_JUST_INSTALLED=true
+        return 0
+    fi
+
+    return 1
+}
+
+# ─── audio-driver binary ────────────────────────────────────
+
+install_binary_from_release() {
+    log "Downloading pre-built audio-driver binary..."
+
+    local url
+    url=$(get_release_asset_url "audio-driver-macos-arm64.tar.gz") || return 1
+    if [ -z "$url" ]; then return 1; fi
+
+    local tmp_tar="/tmp/audio-driver-macos-arm64.tar.gz"
+    if ! download_and_verify "$url" "$tmp_tar"; then
+        rm -f "$tmp_tar"
+        return 1
+    fi
+
+    tar xzf "$tmp_tar" -C /tmp/
+    rm -f "$tmp_tar"
+
+    if [ ! -f "/tmp/audio-driver" ]; then
+        error "Extraction succeeded but binary not found."
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$BINARY_DEST")"
+    mv /tmp/audio-driver "$BINARY_DEST"
+    chmod 755 "$BINARY_DEST"
+    log "audio-driver installed from release."
+    return 0
+}
+
+resolve_cmake() {
+    local candidates=(
+        "/opt/homebrew/bin/cmake"
+        "/usr/local/bin/cmake"
+    )
+    local user_cmake
+    user_cmake=$(sudo -u "$REAL_USER" bash -lc 'command -v cmake' 2>/dev/null || true)
+    if [ -n "$user_cmake" ]; then
+        candidates+=("$user_cmake")
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    warn "cmake not found. Attempting to install via Homebrew..."
+    local local_brew=""
+    if local_brew=$(resolve_brew); then
+        if sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1; then
+            local installed_cmake="$(dirname "$local_brew")/cmake"
+            if [ -x "$installed_cmake" ]; then
+                echo "$installed_cmake"
+                return 0
+            fi
+            installed_cmake="$("$local_brew" --prefix)/bin/cmake"
+            if [ -x "$installed_cmake" ]; then
+                echo "$installed_cmake"
+                return 0
+            fi
         fi
     fi
 
     return 1
 }
 
-install_blackhole() {
-    log "Checking for BlackHole 2ch..."
-    if blackhole_installed; then
-        log "BlackHole 2ch is already installed."
-        BLACKHOLE_OK=true
+install_binary_from_source() {
+    local project_root="${SCRIPT_DIR}/../.."
+    local build_dir="${project_root}/build"
+
+    log "Building audio-driver from source..."
+
+    local cmake_bin
+    if ! cmake_bin=$(resolve_cmake); then
+        error "cmake is required to build audio-driver."
+        error "Install it: brew install cmake"
+        return 1
+    fi
+
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir"
+
+    log "Running cmake configure..."
+    if ! "$cmake_bin" -S "$project_root" -B "$build_dir" -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release </dev/null 2>&1; then
+        error "cmake configure failed."
+        return 1
+    fi
+
+    log "Running cmake build..."
+    if ! "$cmake_bin" --build "$build_dir" --target audio-driver 2>&1; then
+        error "cmake build failed."
+        return 1
+    fi
+
+    if [ ! -f "${build_dir}/audio-driver" ]; then
+        error "Build completed but binary not produced."
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$BINARY_DEST")"
+    cp "${build_dir}/audio-driver" "$BINARY_DEST"
+    chmod 755 "$BINARY_DEST"
+    log "audio-driver built and installed."
+    return 0
+}
+
+install_binary() {
+    # Check if already up to date (when installing from release, always update)
+    if [ "$FROM_SOURCE" = false ]; then
+        if install_binary_from_release; then
+            BINARY_OK=true
+            BINARY_UPDATED=true
+            return 0
+        fi
+        warn "Pre-built download unavailable. Falling back to source build..."
+    fi
+
+    # Source build path
+    local project_root="${SCRIPT_DIR}/../.."
+    local build_dir="${project_root}/build"
+    local binary_source="${build_dir}/audio-driver"
+
+    if [ ! -f "$binary_source" ]; then
+        if ! install_binary_from_source; then
+            if [ -f "$BINARY_DEST" ] && [ -x "$BINARY_DEST" ]; then
+                warn "Build failed but existing binary at ${BINARY_DEST} is usable."
+                BINARY_OK=true
+                return 0
+            fi
+            error "No binary available. The service cannot start without it."
+            return 1
+        fi
+        BINARY_OK=true
+        BINARY_UPDATED=true
         return 0
     fi
 
-    info "BlackHole 2ch is required for system audio loopback on macOS."
-    info "BlackHole is a third-party open source driver (GPLv3) by Existential Audio."
-    info "Homepage: https://existential.audio/blackhole/"
-    echo ""
-
-    # Try Homebrew first (preferred — clean uninstall path)
-    local brew_bin
-    if brew_bin=$(resolve_brew); then
-        log "Installing BlackHole 2ch via Homebrew..."
-        local brew_output
-        if brew_output=$(sudo -u "$REAL_USER" "$brew_bin" install --cask blackhole-2ch 2>&1); then
-            log "BlackHole 2ch installed via Homebrew."
-            BLACKHOLE_OK=true
-            BLACKHOLE_JUST_INSTALLED=true
-            return 0
-        else
-            warn "Homebrew install failed:"
-            echo "$brew_output" | tail -5 | while IFS= read -r line; do warn "  $line"; done
-            warn "Falling back to direct download..."
-        fi
+    # Binary already built locally — install it
+    if [ -f "$BINARY_DEST" ] && cmp -s "$binary_source" "$BINARY_DEST"; then
+        log "Binary at ${BINARY_DEST} is up to date."
     else
-        info "Homebrew not found. Using direct download..."
+        log "Installing binary to ${BINARY_DEST}..."
+        mkdir -p "$(dirname "$BINARY_DEST")"
+        cp "$binary_source" "$BINARY_DEST"
+        chmod 755 "$BINARY_DEST"
+        log "Binary installed."
+        BINARY_UPDATED=true
     fi
 
-    # Direct download fallback
-    log "Downloading BlackHole 2ch v${BLACKHOLE_VERSION}..."
-    local pkg_path="/tmp/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
-
-    if ! curl -fSL -o "$pkg_path" "$BLACKHOLE_PKG_URL"; then
-        error "Failed to download BlackHole from ${BLACKHOLE_PKG_URL}"
-        error "Install BlackHole manually: https://existential.audio/blackhole/"
+    if [ ! -f "$BINARY_DEST" ] || [ ! -x "$BINARY_DEST" ]; then
+        error "Binary installation failed."
         return 1
     fi
 
-    local actual_sha
-    actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
-    if [ "$actual_sha" != "$BLACKHOLE_SHA256" ]; then
-        error "Checksum mismatch for BlackHole package!"
-        error "Expected: ${BLACKHOLE_SHA256}"
-        error "Got:      ${actual_sha}"
-        rm -f "$pkg_path"
-        return 1
-    fi
-    log "Checksum verified."
-
-    log "Installing BlackHole 2ch..."
-    local installer_output
-    if installer_output=$(installer -pkg "$pkg_path" -target / 2>&1); then
-        log "BlackHole 2ch installed successfully."
-        BLACKHOLE_OK=true
-        BLACKHOLE_JUST_INSTALLED=true
-    else
-        error "Failed to install BlackHole package:"
-        echo "$installer_output" | while IFS= read -r line; do error "  $line"; done
-        error "Install manually: https://existential.audio/blackhole/"
-        rm -f "$pkg_path"
-        return 1
-    fi
-
-    rm -f "$pkg_path"
+    BINARY_OK=true
     return 0
 }
 
@@ -218,13 +418,14 @@ if [ "${1:-}" = "--uninstall" ]; then
     # Clean up socket
     rm -f /tmp/audio-driver.sock
 
-    echo ""
-    warn "BlackHole 2ch was NOT uninstalled (other apps may depend on it)."
-    warn "To uninstall BlackHole manually:"
-    warn "  brew uninstall --cask blackhole-2ch"
-    warn "  — or —"
-    warn "  sudo rm -rf /Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver"
-    warn "  sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod"
+    # Remove SullaLoopback driver
+    if [ -d "$LOOPBACK_HAL_PATH" ]; then
+        rm -rf "$LOOPBACK_HAL_PATH"
+        launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
+            killall coreaudiod 2>/dev/null || true
+        log "SullaLoopback driver removed."
+    fi
+
     echo ""
     warn "Config preserved at: ${REAL_CONFIG}"
     warn "To remove config: rm -rf '${REAL_CONFIG}'"
@@ -240,149 +441,28 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-SKIP_BLACKHOLE=false
+SKIP_LOOPBACK=false
+FROM_SOURCE=false
 for arg in "$@"; do
-    if [ "$arg" = "--skip-blackhole" ]; then
-        SKIP_BLACKHOLE=true
-    fi
+    case "$arg" in
+        --skip-loopback|--skip-blackhole) SKIP_LOOPBACK=true ;;
+        --from-source) FROM_SOURCE=true ;;
+    esac
 done
 
 log "Installing Audio Driver..."
 echo ""
 
-# ─── Step 1: BlackHole ────────────────────────────────────────
+# ─── Step 1: SullaLoopback driver ────────────────────────────
 
-if [ "$SKIP_BLACKHOLE" = false ]; then
-    if ! install_blackhole; then
-        warn "Continuing without BlackHole. System audio capture may not work."
-        warn "Install BlackHole later: https://existential.audio/blackhole/"
+if [ "$SKIP_LOOPBACK" = false ]; then
+    if ! install_loopback; then
+        warn "Continuing without SullaLoopback. System audio capture may not work."
     fi
     echo ""
 fi
 
-# ─── Step 2: Build and install binary ─────────────────────────
-
-PROJECT_ROOT="${SCRIPT_DIR}/../.."
-BUILD_DIR="${PROJECT_ROOT}/build"
-BINARY_SOURCE="${BUILD_DIR}/audio-driver"
-
-resolve_cmake() {
-    # Check common locations (root's PATH won't include Homebrew)
-    local candidates=(
-        "/opt/homebrew/bin/cmake"
-        "/usr/local/bin/cmake"
-    )
-    # Ask the real user's shell where cmake is
-    local user_cmake
-    user_cmake=$(sudo -u "$REAL_USER" bash -lc 'command -v cmake' 2>/dev/null || true)
-    if [ -n "$user_cmake" ]; then
-        candidates+=("$user_cmake")
-    fi
-
-    for candidate in "${candidates[@]}"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            echo "$candidate"
-            return 0
-        fi
-    done
-
-    # Not found — try to install via Homebrew
-    warn "cmake not found. Attempting to install via Homebrew..."
-    local local_brew=""
-    if local_brew=$(resolve_brew); then
-        if sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1; then
-            local installed_cmake="$(dirname "$local_brew")/cmake"
-            if [ -x "$installed_cmake" ]; then
-                echo "$installed_cmake"
-                return 0
-            fi
-            installed_cmake="$("$local_brew" --prefix)/bin/cmake"
-            if [ -x "$installed_cmake" ]; then
-                echo "$installed_cmake"
-                return 0
-            fi
-        fi
-    fi
-
-    return 1
-}
-
-build_binary() {
-    log "Building audio-driver from source..."
-
-    local cmake_bin
-    if ! cmake_bin=$(resolve_cmake); then
-        error "cmake is required to build audio-driver."
-        error "Install it: brew install cmake"
-        error "Then re-run this installer."
-        return 1
-    fi
-
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
-
-    log "Running cmake configure..."
-    if ! "$cmake_bin" -S "$PROJECT_ROOT" -B "$BUILD_DIR" -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release </dev/null 2>&1; then
-        error "cmake configure failed. Full output above."
-        return 1
-    fi
-
-    log "Running cmake build..."
-    if ! "$cmake_bin" --build "$BUILD_DIR" --target audio-driver 2>&1; then
-        error "cmake build failed. Full output above."
-        return 1
-    fi
-
-    if [ ! -f "$BINARY_SOURCE" ]; then
-        error "Build completed but binary not produced."
-        return 1
-    fi
-
-    log "Build successful."
-    return 0
-}
-
-install_binary() {
-    # Step A: Ensure we have a build artifact
-    if [ ! -f "$BINARY_SOURCE" ]; then
-        if ! build_binary; then
-            if [ -f "$BINARY_DEST" ] && [ -x "$BINARY_DEST" ]; then
-                warn "Build failed but existing binary at ${BINARY_DEST} is usable."
-                BINARY_OK=true
-                return 0
-            fi
-            error "No binary available. The service cannot start without it."
-            return 1
-        fi
-    fi
-
-    # Step B: Always copy to destination — this is the step that must not be skipped
-    if [ -f "$BINARY_DEST" ] && cmp -s "$BINARY_SOURCE" "$BINARY_DEST"; then
-        log "Binary at ${BINARY_DEST} is up to date."
-    else
-        log "Installing binary to ${BINARY_DEST}..."
-        mkdir -p "$(dirname "$BINARY_DEST")"
-        cp "$BINARY_SOURCE" "$BINARY_DEST"
-        chmod 755 "$BINARY_DEST"
-        log "Binary installed."
-        BINARY_UPDATED=true
-    fi
-
-    # Step C: Verify it's actually there and executable
-    if [ ! -f "$BINARY_DEST" ]; then
-        error "Binary copy failed — ${BINARY_DEST} does not exist after cp."
-        error "Check permissions on $(dirname "$BINARY_DEST")"
-        return 1
-    fi
-
-    if [ ! -x "$BINARY_DEST" ]; then
-        error "Binary at ${BINARY_DEST} is not executable after chmod."
-        return 1
-    fi
-
-    BINARY_OK=true
-    return 0
-}
+# ─── Step 2: Install binary ──────────────────────────────────
 
 install_binary
 echo ""
@@ -429,24 +509,24 @@ else
     log "Config exists at ${REAL_CONFIG}/config.ini"
 fi
 
-# ─── Step 4: coreaudiod (only if BlackHole was just installed) ─
+# ─── Step 4: coreaudiod (only if loopback driver was just installed) ─
 
-if [ "$BLACKHOLE_JUST_INSTALLED" = true ]; then
-    log "Restarting coreaudiod to detect newly installed BlackHole..."
+if [ "$LOOPBACK_JUST_INSTALLED" = true ]; then
+    log "Restarting coreaudiod to detect SullaLoopback..."
     launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
         killall coreaudiod 2>/dev/null || true
 
     tries=0
     while [ $tries -lt 5 ]; do
         sleep 1
-        if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
-            log "BlackHole virtual audio device detected!"
+        if system_profiler SPAudioDataType 2>/dev/null | grep -qi "SullaLoopback"; then
+            log "SullaLoopback virtual audio device detected!"
             break
         fi
         tries=$((tries + 1))
     done
     if [ $tries -eq 5 ]; then
-        warn "BlackHole not yet visible. A reboot may be required."
+        warn "SullaLoopback not yet visible. A reboot may be required."
     fi
 fi
 
@@ -563,21 +643,14 @@ PLISTEOF
     chown "${REAL_USER}" "$PLIST_PATH"
 
     # ── Unload any existing registration ──
-    # launchd can hold onto a service label even after the process exits,
-    # which causes bootstrap to fail with "service already loaded".
-    # We must fully remove it before re-bootstrapping.
-
     local service_target="gui/${REAL_UID}/${PLIST_LABEL}"
 
     if sudo -u "$REAL_USER" launchctl print "$service_target" &>/dev/null; then
         log "Stopping existing service..."
         sudo -u "$REAL_USER" launchctl bootout "$service_target" 2>/dev/null || true
-        # Give launchd time to fully release the label
         sleep 1
     fi
 
-    # Double-check: if bootout didn't fully clear the label, force-remove it.
-    # This handles zombie registrations where bootout silently fails.
     if sudo -u "$REAL_USER" launchctl print "$service_target" &>/dev/null; then
         warn "Service label still registered after bootout — force removing..."
         sudo -u "$REAL_USER" launchctl remove "${PLIST_LABEL}" 2>/dev/null || true
@@ -589,15 +662,12 @@ PLISTEOF
     if bootstrap_err=$(sudo -u "$REAL_USER" launchctl bootstrap "gui/${REAL_UID}" "$PLIST_PATH" 2>&1); then
         log "Service started (as user: ${REAL_USER})."
     else
-        # If bootstrap still fails, try kickstart in case launchd already
-        # picked up the plist from the LaunchAgents directory automatically
         if echo "$bootstrap_err" | grep -qi "already"; then
             warn "Service was auto-loaded by launchd. Restarting..."
             if sudo -u "$REAL_USER" launchctl kickstart -k "$service_target" 2>/dev/null; then
                 log "Service restarted (as user: ${REAL_USER})."
             else
                 error "Failed to restart service."
-                error "Debug: launchctl print $service_target"
                 error "Try manually:"
                 error "  launchctl bootout $service_target"
                 error "  launchctl bootstrap gui/\$(id -u) ${PLIST_PATH}"
@@ -645,12 +715,12 @@ echo "────────────────────────�
 
 FAILURES=0
 
-if [ "$BLACKHOLE_OK" = true ]; then
-    log "  BlackHole 2ch .......... OK"
-elif [ "$SKIP_BLACKHOLE" = true ]; then
-    warn "  BlackHole 2ch .......... SKIPPED"
+if [ "$LOOPBACK_OK" = true ]; then
+    log "  SullaLoopback .......... OK"
+elif [ "$SKIP_LOOPBACK" = true ]; then
+    warn "  SullaLoopback .......... SKIPPED"
 else
-    error "  BlackHole 2ch .......... FAILED"
+    error "  SullaLoopback .......... FAILED"
     FAILURES=$((FAILURES + 1))
 fi
 

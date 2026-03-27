@@ -1,0 +1,149 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0). Leave empty for artifact-only build.'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  LOOPBACK_DRIVER_NAME: SullaLoopback
+  LOOPBACK_CHANNELS: 2
+
+jobs:
+  build-loopback-driver:
+    name: Build SullaLoopback driver
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone BlackHole
+        run: |
+          git clone --depth 1 --branch v0.6.1 \
+            https://github.com/ExistentialAudio/BlackHole.git \
+            /tmp/BlackHole
+
+      - name: Build driver
+        run: |
+          VARIANT="${LOOPBACK_DRIVER_NAME}${LOOPBACK_CHANNELS}ch"
+          BUNDLE_ID="com.sulla.${VARIANT}"
+          UUID=$(uuidgen)
+
+          xcodebuild \
+            -project /tmp/BlackHole/BlackHole.xcodeproj \
+            -configuration Release \
+            -target BlackHole \
+            CONFIGURATION_BUILD_DIR=/tmp/loopback-build \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            GCC_PREPROCESSOR_DEFINITIONS='$(GCC_PREPROCESSOR_DEFINITIONS)
+              kNumber_Of_Channels='"$LOOPBACK_CHANNELS"'
+              kPlugIn_BundleID=\"'"$BUNDLE_ID"'\"
+              kDriver_Name=\"'"$LOOPBACK_DRIVER_NAME"'\"
+              kDevice_IsHidden=true
+              kDevice2_IsHidden=true'
+
+          # Rename bundle
+          mv /tmp/loopback-build/BlackHole.driver "/tmp/loopback-build/${VARIANT}.driver"
+
+          # Unique CFPlugIn UUID so it can coexist with stock BlackHole
+          PLIST="/tmp/loopback-build/${VARIANT}.driver/Contents/Info.plist"
+          sed -i '' "s/e395c745-4eea-4d94-bb92-46224221047c/${UUID}/g" "$PLIST"
+
+          echo "Built ${VARIANT}.driver with UUID ${UUID}"
+
+      - name: Package driver
+        run: |
+          VARIANT="${LOOPBACK_DRIVER_NAME}${LOOPBACK_CHANNELS}ch"
+          cd /tmp/loopback-build
+          tar czf "${VARIANT}.driver.tar.gz" "${VARIANT}.driver"
+          shasum -a 256 "${VARIANT}.driver.tar.gz" > "${VARIANT}.driver.tar.gz.sha256"
+          cat "${VARIANT}.driver.tar.gz.sha256"
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopback-driver
+          path: |
+            /tmp/loopback-build/${{ env.LOOPBACK_DRIVER_NAME }}${{ env.LOOPBACK_CHANNELS }}ch.driver.tar.gz
+            /tmp/loopback-build/${{ env.LOOPBACK_DRIVER_NAME }}${{ env.LOOPBACK_CHANNELS }}ch.driver.tar.gz.sha256
+
+  build-audio-driver:
+    name: Build audio-driver binary
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target audio-driver
+
+      - name: Package binary
+        run: |
+          cp build/audio-driver /tmp/audio-driver
+          chmod 755 /tmp/audio-driver
+          cd /tmp
+          tar czf audio-driver-macos-arm64.tar.gz audio-driver
+          shasum -a 256 audio-driver-macos-arm64.tar.gz > audio-driver-macos-arm64.tar.gz.sha256
+          cat audio-driver-macos-arm64.tar.gz.sha256
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-driver-macos
+          path: |
+            /tmp/audio-driver-macos-arm64.tar.gz
+            /tmp/audio-driver-macos-arm64.tar.gz.sha256
+
+  test:
+    name: Run tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with tests
+        run: |
+          cmake -S . -B build -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
+
+  release:
+    name: Create GitHub Release
+    needs: [build-loopback-driver, build-audio-driver, test]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/loopback-driver/*
+            artifacts/audio-driver-macos/*

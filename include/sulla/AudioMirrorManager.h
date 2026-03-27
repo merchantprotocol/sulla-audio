@@ -13,13 +13,13 @@ namespace sulla {
 
 /**
  * AudioMirrorManager — dynamically manages a Multi-Output Device
- * that mirrors the user's active output to BlackHole for capture.
+ * that mirrors the user's active output to the loopback driver for capture.
  *
  * When a CSR switches from speakers to a headset (or any output change),
  * this class detects it via a CoreAudio property listener, tears down
  * the old Multi-Output Device, and creates a new one combining the
- * new output + BlackHole. Then sets it as default output so audio
- * continues flowing to both the user's device and BlackHole.
+ * new output + loopback driver. Then sets it as default output so audio
+ * continues flowing to both the user's device and the loopback driver.
  *
  * Lifecycle:
  *   start() — installs the listener, creates initial mirror
@@ -29,28 +29,28 @@ class AudioMirrorManager {
 public:
     static constexpr const char* kMirrorName = "Sulla Audio Mirror";
     static constexpr const char* kMirrorUID  = "SullaAudioMirror_UID";
-    static constexpr const char* kBlackHoleUID = "BlackHole2ch_UID";
+    static constexpr const char* kLoopbackUID = "SullaLoopback2ch_UID";
 
-    using DeviceChangedCallback = std::function<void(AudioDeviceID blackholeDeviceId)>;
+    using DeviceChangedCallback = std::function<void(AudioDeviceID loopbackDeviceId)>;
 
     AudioMirrorManager() = default;
     ~AudioMirrorManager() { stop(); }
 
     /**
      * Start managing the audio mirror.
-     * Finds BlackHole, creates the initial Multi-Output Device,
+     * Finds the loopback driver, creates the initial Multi-Output Device,
      * and installs a listener for output device changes.
      */
     bool start() {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Find BlackHole
-        blackholeId_ = findDeviceByUID(kBlackHoleUID);
-        if (blackholeId_ == kAudioObjectUnknown) {
-            SULLA_LOG_ERROR("Mirror", "BlackHole 2ch not found — cannot create audio mirror");
+        // Find loopback driver
+        loopbackId_ = findDeviceByUID(kLoopbackUID);
+        if (loopbackId_ == kAudioObjectUnknown) {
+            SULLA_LOG_ERROR("Mirror", "SullaLoopback not found — cannot create audio mirror");
             return false;
         }
-        SULLA_LOG_INFO("Mirror", "Found BlackHole 2ch (ID: " + std::to_string(blackholeId_) + ")");
+        SULLA_LOG_INFO("Mirror", "Found SullaLoopback (ID: " + std::to_string(loopbackId_) + ")");
 
         // Create the initial mirror
         if (!rebuildMirror()) {
@@ -120,15 +120,15 @@ public:
     /** Called when capture should re-initialize after a mirror rebuild. */
     void onDeviceChanged(DeviceChangedCallback cb) { deviceChangedCb_ = std::move(cb); }
 
-    /** Get the BlackHole device ID (for capture backend to use). */
-    AudioDeviceID blackholeDeviceId() const { return blackholeId_; }
+    /** Get the loopback device ID (for capture backend to use). */
+    AudioDeviceID loopbackDeviceId() const { return loopbackId_; }
 
     /** Get the current mirror device ID. */
     AudioDeviceID mirrorDeviceId() const { return mirrorId_; }
 
 private:
     std::mutex mutex_;
-    AudioDeviceID blackholeId_ = kAudioObjectUnknown;
+    AudioDeviceID loopbackId_ = kAudioObjectUnknown;
     AudioDeviceID mirrorId_ = kAudioObjectUnknown;
     AudioDeviceID lastPhysicalOutput_ = kAudioObjectUnknown;
     bool listening_ = false;
@@ -177,9 +177,9 @@ private:
         std::string currentUID = getDeviceUID(currentDefault);
         if (currentUID == kMirrorUID) return;
 
-        // If it's BlackHole itself, don't mirror (would create a loop)
-        if (currentUID == kBlackHoleUID) {
-            SULLA_LOG_WARN("Mirror", "Default output switched to BlackHole — skipping mirror rebuild");
+        // If it's the loopback driver itself, don't mirror (would create a loop)
+        if (currentUID == kLoopbackUID) {
+            SULLA_LOG_WARN("Mirror", "Default output switched to loopback driver — skipping mirror rebuild");
             return;
         }
 
@@ -213,12 +213,12 @@ private:
 
         // Give macOS a moment to settle the default output, then rebuild
         // The output change listener will fire and handle the rebuild
-        // But if the default lands on BlackHole, we need to force it
+        // But if the default lands on the loopback driver, we need to force it
         AudioDeviceID newDefault = getDefaultOutputDevice();
         std::string newUID = getDeviceUID(newDefault);
 
-        if (newUID == kBlackHoleUID || newUID == kMirrorUID || newUID.empty()) {
-            // macOS fell back to BlackHole or nothing — find a real device
+        if (newUID == kLoopbackUID || newUID == kMirrorUID || newUID.empty()) {
+            // macOS fell back to loopback driver or nothing — find a real device
             AudioDeviceID fallback = findFallbackOutputDevice();
             if (fallback != kAudioObjectUnknown) {
                 setDefaultOutputDevice(fallback);
@@ -235,7 +235,7 @@ private:
 
     /**
      * Destroy old mirror (if any), create a new one with the current
-     * physical output + BlackHole, set it as default.
+     * physical output + loopback driver, set it as default.
      */
     bool rebuildMirror() {
         rebuilding_ = true;
@@ -248,7 +248,7 @@ private:
                 rebuilding_ = false;
                 return false;
             }
-            // Make sure it's not already our mirror or BlackHole
+            // Make sure it's not already our mirror or the loopback driver
             std::string uid = getDeviceUID(physicalOutput);
             if (uid == kMirrorUID) {
                 // Default output is already our mirror — destroy it and rebuild
@@ -272,7 +272,7 @@ private:
                     lastPhysicalOutput_ = physicalOutput;
                 }
                 // Fall through to destroy + recreate below
-            } else if (uid == kBlackHoleUID) {
+            } else if (uid == kLoopbackUID) {
                 rebuilding_ = false;
                 return false;
             }
@@ -297,9 +297,9 @@ private:
             return false;
         }
 
-        SULLA_LOG_INFO("Mirror", "Creating mirror: " + physicalName + " + BlackHole 2ch");
+        SULLA_LOG_INFO("Mirror", "Creating mirror: " + physicalName + " + SullaLoopback");
 
-        // Build sub-device list: physical output first (main), BlackHole second
+        // Build sub-device list: physical output first (main), loopback second
         CFMutableArrayRef subDevices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
 
         CFMutableDictionaryRef physDict = CFDictionaryCreateMutable(
@@ -312,7 +312,7 @@ private:
 
         CFMutableDictionaryRef bhDict = CFDictionaryCreateMutable(
             kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFStringRef bhUIDRef = CFStringCreateWithCString(kCFAllocatorDefault, kBlackHoleUID, kCFStringEncodingUTF8);
+        CFStringRef bhUIDRef = CFStringCreateWithCString(kCFAllocatorDefault, kLoopbackUID, kCFStringEncodingUTF8);
         CFDictionarySetValue(bhDict, CFSTR(kAudioSubDeviceUIDKey), bhUIDRef);
         CFArrayAppendValue(subDevices, bhDict);
         CFRelease(bhUIDRef);
@@ -333,6 +333,12 @@ private:
         int stacked = 1;
         CFNumberRef stackedRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &stacked);
         CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsStackedKey), stackedRef);
+
+        // Hide the aggregate device from System Settings and Audio MIDI Setup
+        int isPrivate = 1;
+        CFNumberRef privateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &isPrivate);
+        CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsPrivateKey), privateRef);
+        CFRelease(privateRef);
 
         // Set the physical output as the master sub-device for volume control.
         // Without this, macOS disables the volume keys and slider because
@@ -368,9 +374,9 @@ private:
 
         rebuilding_ = false;
 
-        // Notify that BlackHole should now have audio
+        // Notify that loopback driver should now have audio
         if (deviceChangedCb_) {
-            deviceChangedCb_(blackholeId_);
+            deviceChangedCb_(loopbackId_);
         }
 
         return true;
@@ -444,7 +450,7 @@ private:
     }
 
     /**
-     * Given an aggregate device, find its first sub-device that isn't BlackHole.
+     * Given an aggregate device, find its first sub-device that isn't the loopback driver.
      * Used to recover the physical output device from an existing mirror.
      */
     static AudioDeviceID getFirstNonBlackholeSubDevice(AudioDeviceID aggregateDevice) {
@@ -466,7 +472,7 @@ private:
 
         for (auto sub : subDevices) {
             std::string uid = getDeviceUID(sub);
-            if (uid != kBlackHoleUID && uid != kMirrorUID && !uid.empty()) {
+            if (uid != kLoopbackUID && uid != kMirrorUID && !uid.empty()) {
                 return sub;
             }
         }
@@ -494,7 +500,7 @@ private:
 
     /**
      * Find a physical output device to fall back to when the current one disappears.
-     * Skips BlackHole, our mirror, and any device without output channels.
+     * Skips loopback driver, our mirror, and any device without output channels.
      */
     static AudioDeviceID findFallbackOutputDevice() {
         AudioObjectPropertyAddress addr = {
@@ -510,7 +516,7 @@ private:
 
         for (auto dev : devices) {
             std::string uid = getDeviceUID(dev);
-            if (uid == kMirrorUID || uid == kBlackHoleUID || uid.empty()) continue;
+            if (uid == kMirrorUID || uid == kLoopbackUID || uid.empty()) continue;
 
             // Check it has output channels
             AudioObjectPropertyAddress outAddr = {
@@ -536,7 +542,7 @@ private:
         // No preferred device found — return first device with output channels
         for (auto dev : devices) {
             std::string uid = getDeviceUID(dev);
-            if (uid == kMirrorUID || uid == kBlackHoleUID || uid.empty()) continue;
+            if (uid == kMirrorUID || uid == kLoopbackUID || uid.empty()) continue;
             AudioObjectPropertyAddress outAddr = {
                 kAudioDevicePropertyStreamConfiguration,
                 kAudioObjectPropertyScopeOutput,

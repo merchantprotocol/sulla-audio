@@ -104,6 +104,6 @@ endif()
 # ─── Install ──────────────────────────────────────────────────
 install(TARGETS audio-driver DESTINATION bin)
 
-# macOS: BlackHole virtual audio device is an external dependency.
-# Install via: brew install --cask blackhole-2ch
-# Or run: sudo installer/macos/install.sh (handles BlackHole automatically)
+# macOS: SullaLoopback virtual audio device (custom BlackHole fork).
+# Built from source by: installer/macos/build-loopback-driver.sh
+# Or run: sudo installer/macos/install.sh (builds and installs automatically)
