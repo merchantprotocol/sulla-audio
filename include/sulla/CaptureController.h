@@ -195,11 +195,8 @@ private:
             std::vector<uint8_t> raw(chunkBytes);
             ringBuffer_.read(raw.data(), chunkBytes);
 
-            // Tag with channel header
-            auto tagged = AudioChunkHeader::tag(raw.data(), raw.size(), config_.channel);
-
             if (chunkCallback_) {
-                chunkCallback_(tagged);
+                chunkCallback_(raw);
             }
         }
     }
