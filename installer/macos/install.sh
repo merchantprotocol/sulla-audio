@@ -450,60 +450,46 @@ if [ "$BLACKHOLE_JUST_INSTALLED" = true ]; then
     fi
 fi
 
-# ─── Step 5: Multi-Output Device (routes system audio → BlackHole) ─
+# ─── Step 5: Clean up stale Multi-Output Devices ────────────────────
+#
+# The audio driver creates and manages the Multi-Output Device dynamically
+# at runtime (AudioMirrorManager). The installer's job is only to remove
+# any stale mirror left over from a previous install or crash, so the
+# driver starts clean.
 
 MULTI_OUTPUT_OK=false
 
-setup_multi_output() {
-    if [ "$BLACKHOLE_OK" != true ] && [ "$SKIP_BLACKHOLE" = true ]; then
-        warn "BlackHole not installed — skipping Multi-Output Device."
-        return 1
-    fi
-
+cleanup_stale_mirror() {
     local swift_src="${SCRIPT_DIR}/create-multi-output.swift"
     local swift_bin="/tmp/sulla-create-multi-output"
 
     if [ ! -f "$swift_src" ]; then
-        error "create-multi-output.swift not found at ${swift_src}"
-        return 1
-    fi
-
-    # Compile the Swift helper
-    log "Compiling Multi-Output Device helper..."
-    if ! swiftc -O "$swift_src" -o "$swift_bin" 2>&1; then
-        error "Failed to compile create-multi-output.swift"
-        return 1
-    fi
-
-    # Check if it already exists
-    if "$swift_bin" --check 2>/dev/null; then
-        log "Multi-Output Device already exists."
+        # No helper available — driver will handle it
         MULTI_OUTPUT_OK=true
         return 0
     fi
 
-    # Create it (must run as the real user for audio session access)
-    log "Creating Multi-Output Device (mirrors speakers → BlackHole)..."
-    local output
-    if output=$(sudo -u "$REAL_USER" "$swift_bin" 2>&1); then
-        echo "$output" | while IFS= read -r line; do log "  $line"; done
+    # Compile the Swift helper (only used for --remove / --check)
+    if ! swiftc -O "$swift_src" -o "$swift_bin" 2>&1; then
+        warn "Could not compile Swift helper — driver will manage mirror at runtime"
         MULTI_OUTPUT_OK=true
-    else
-        echo "$output" | while IFS= read -r line; do warn "  $line"; done
-        warn "Multi-Output Device creation failed."
-        warn "You can create it manually in Audio MIDI Setup:"
-        warn "  1. Open /Applications/Utilities/Audio MIDI Setup.app"
-        warn "  2. Click '+' → Create Multi-Output Device"
-        warn "  3. Check your speakers AND BlackHole 2ch"
-        warn "  4. Set the Multi-Output Device as your system output"
-        return 1
+        return 0
+    fi
+
+    # Remove any existing mirror so the driver creates a fresh one on startup
+    # with the correct physical device and master sub-device for volume control
+    if "$swift_bin" --check 2>/dev/null; then
+        log "Removing stale Multi-Output Device (driver will recreate)..."
+        sudo -u "$REAL_USER" "$swift_bin" --remove 2>/dev/null || true
     fi
 
     rm -f "$swift_bin"
+    MULTI_OUTPUT_OK=true
+    log "Multi-Output Device will be created by audio driver on startup."
     return 0
 }
 
-setup_multi_output
+cleanup_stale_mirror
 echo ""
 
 # ─── Step 6: Ensure launchd service is running ────────────────
@@ -669,7 +655,7 @@ else
 fi
 
 if [ "$MULTI_OUTPUT_OK" = true ]; then
-    log "  Multi-Output Device .... OK  (Sulla Audio Mirror)"
+    log "  Multi-Output Device .... OK  (managed by driver)"
 else
     warn "  Multi-Output Device .... MANUAL SETUP NEEDED"
 fi
