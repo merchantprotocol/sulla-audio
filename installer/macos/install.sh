@@ -576,18 +576,52 @@ PLISTEOF
     chmod 644 "$PLIST_PATH"
     chown "${REAL_USER}" "$PLIST_PATH"
 
-    # Stop if registered
-    sudo -u "$REAL_USER" launchctl bootout "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null || true
+    # ── Unload any existing registration ──
+    # launchd can hold onto a service label even after the process exits,
+    # which causes bootstrap to fail with "service already loaded".
+    # We must fully remove it before re-bootstrapping.
 
-    # Start as user agent
-    if sudo -u "$REAL_USER" launchctl bootstrap "gui/${REAL_UID}" "$PLIST_PATH" 2>/dev/null; then
+    local service_target="gui/${REAL_UID}/${PLIST_LABEL}"
+
+    if sudo -u "$REAL_USER" launchctl print "$service_target" &>/dev/null; then
+        log "Stopping existing service..."
+        sudo -u "$REAL_USER" launchctl bootout "$service_target" 2>/dev/null || true
+        # Give launchd time to fully release the label
+        sleep 1
+    fi
+
+    # Double-check: if bootout didn't fully clear the label, force-remove it.
+    # This handles zombie registrations where bootout silently fails.
+    if sudo -u "$REAL_USER" launchctl print "$service_target" &>/dev/null; then
+        warn "Service label still registered after bootout — force removing..."
+        sudo -u "$REAL_USER" launchctl remove "${PLIST_LABEL}" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # ── Load the service fresh ──
+    local bootstrap_err
+    if bootstrap_err=$(sudo -u "$REAL_USER" launchctl bootstrap "gui/${REAL_UID}" "$PLIST_PATH" 2>&1); then
         log "Service started (as user: ${REAL_USER})."
     else
-        if sudo -u "$REAL_USER" launchctl kickstart -k "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null; then
-            log "Service restarted (as user: ${REAL_USER})."
+        # If bootstrap still fails, try kickstart in case launchd already
+        # picked up the plist from the LaunchAgents directory automatically
+        if echo "$bootstrap_err" | grep -qi "already"; then
+            warn "Service was auto-loaded by launchd. Restarting..."
+            if sudo -u "$REAL_USER" launchctl kickstart -k "$service_target" 2>/dev/null; then
+                log "Service restarted (as user: ${REAL_USER})."
+            else
+                error "Failed to restart service."
+                error "Debug: launchctl print $service_target"
+                error "Try manually:"
+                error "  launchctl bootout $service_target"
+                error "  launchctl bootstrap gui/\$(id -u) ${PLIST_PATH}"
+                return 1
+            fi
         else
-            error "Failed to start user agent."
-            error "Try manually: launchctl bootstrap gui/\$(id -u) ${PLIST_PATH}"
+            error "Failed to start user agent: $bootstrap_err"
+            error "Try manually:"
+            error "  launchctl bootout $service_target"
+            error "  launchctl bootstrap gui/\$(id -u) ${PLIST_PATH}"
             return 1
         fi
     fi
