@@ -322,6 +322,13 @@ private:
         CFNumberRef stackedRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &stacked);
         CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsStackedKey), stackedRef);
 
+        // Set the physical output as the master sub-device for volume control.
+        // Without this, macOS disables the volume keys and slider because
+        // it doesn't know which sub-device should handle volume.
+        CFStringRef masterRef = CFStringCreateWithCString(kCFAllocatorDefault, physicalUID.c_str(), kCFStringEncodingUTF8);
+        CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceMasterSubDeviceKey), masterRef);
+        CFRelease(masterRef);
+
         AudioDeviceID newMirror = kAudioObjectUnknown;
         OSStatus status = AudioHardwareCreateAggregateDevice(desc, &newMirror);
 
