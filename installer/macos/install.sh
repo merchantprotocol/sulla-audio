@@ -247,30 +247,41 @@ BUILD_DIR="${PROJECT_ROOT}/build"
 BINARY_SOURCE="${BUILD_DIR}/audio-driver"
 
 resolve_cmake() {
-    local bin=""
-    if command -v cmake &>/dev/null; then
-        bin="cmake"
-    elif [ -x /opt/homebrew/bin/cmake ]; then
-        bin="/opt/homebrew/bin/cmake"
-    elif [ -x /usr/local/bin/cmake ]; then
-        bin="/usr/local/bin/cmake"
+    # Check common locations (root's PATH won't include Homebrew)
+    local candidates=(
+        "/opt/homebrew/bin/cmake"
+        "/usr/local/bin/cmake"
+    )
+    # Ask the real user's shell where cmake is
+    local user_cmake
+    user_cmake=$(sudo -u "$REAL_USER" bash -lc 'command -v cmake' 2>/dev/null || true)
+    if [ -n "$user_cmake" ]; then
+        candidates+=("$user_cmake")
     fi
 
-    if [ -z "$bin" ]; then
-        warn "cmake not found. Attempting to install via Homebrew..."
-        local local_brew=""
-        if local_brew=$(resolve_brew); then
-            sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1 | tail -5
-            bin="$(dirname "$local_brew")/cmake"
-            if [ ! -x "$bin" ]; then
-                bin="$("$local_brew" --prefix)/bin/cmake"
+    for candidate in "${candidates[@]}"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    # Not found — try to install via Homebrew
+    warn "cmake not found. Attempting to install via Homebrew..."
+    local local_brew=""
+    if local_brew=$(resolve_brew); then
+        if sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1; then
+            local installed_cmake="$(dirname "$local_brew")/cmake"
+            if [ -x "$installed_cmake" ]; then
+                echo "$installed_cmake"
+                return 0
+            fi
+            installed_cmake="$("$local_brew" --prefix)/bin/cmake"
+            if [ -x "$installed_cmake" ]; then
+                echo "$installed_cmake"
+                return 0
             fi
         fi
-    fi
-
-    if [ -n "$bin" ] && [ -x "$bin" ]; then
-        echo "$bin"
-        return 0
     fi
 
     return 1
