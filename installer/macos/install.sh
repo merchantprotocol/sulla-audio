@@ -28,7 +28,10 @@ BINARY_NAME="audio-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST_LABEL="com.audiodriver.agent"
-PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+OLD_PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+# LaunchAgent runs as the user — required for CoreAudio session access
+PLIST_DIR="${REAL_HOME}/Library/LaunchAgents"
+PLIST_PATH="${PLIST_DIR}/${PLIST_LABEL}.plist"
 
 # Resolve the real (non-root) user — critical for brew and config ownership
 REAL_USER="${SUDO_USER:-$USER}"
@@ -186,14 +189,29 @@ install_blackhole() {
 if [ "${1:-}" = "--uninstall" ]; then
     log "Uninstalling Audio Driver..."
 
-    # Stop and remove launchd service
+    # Stop and remove launchd service (check both old system daemon and new user agent)
+    local REAL_UID
+    REAL_UID=$(id -u "$REAL_USER")
     launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
-    rm -f "$PLIST_PATH"
+    sudo -u "$REAL_USER" launchctl bootout "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null || true
+    rm -f "$OLD_PLIST_PATH" "$PLIST_PATH"
     log "Service removed."
 
     if [ -f "$BINARY_DEST" ]; then
         rm -f "$BINARY_DEST"
         log "Removed ${BINARY_DEST}"
+    fi
+
+    # Remove Multi-Output Device
+    local swift_src="${SCRIPT_DIR}/create-multi-output.swift"
+    local swift_bin="/tmp/sulla-create-multi-output"
+    if [ -f "$swift_src" ]; then
+        if swiftc -O "$swift_src" -o "$swift_bin" 2>/dev/null; then
+            if "$swift_bin" --remove 2>&1; then
+                log "Multi-Output Device removed."
+            fi
+            rm -f "$swift_bin"
+        fi
     fi
 
     # Clean up socket
@@ -431,7 +449,63 @@ if [ "$BLACKHOLE_JUST_INSTALLED" = true ]; then
     fi
 fi
 
-# ─── Step 5: Ensure launchd service is running ────────────────
+# ─── Step 5: Multi-Output Device (routes system audio → BlackHole) ─
+
+MULTI_OUTPUT_OK=false
+
+setup_multi_output() {
+    if [ "$BLACKHOLE_OK" != true ] && [ "$SKIP_BLACKHOLE" = true ]; then
+        warn "BlackHole not installed — skipping Multi-Output Device."
+        return 1
+    fi
+
+    local swift_src="${SCRIPT_DIR}/create-multi-output.swift"
+    local swift_bin="/tmp/sulla-create-multi-output"
+
+    if [ ! -f "$swift_src" ]; then
+        error "create-multi-output.swift not found at ${swift_src}"
+        return 1
+    fi
+
+    # Compile the Swift helper
+    log "Compiling Multi-Output Device helper..."
+    if ! swiftc -O "$swift_src" -o "$swift_bin" 2>&1; then
+        error "Failed to compile create-multi-output.swift"
+        return 1
+    fi
+
+    # Check if it already exists
+    if "$swift_bin" --check 2>/dev/null; then
+        log "Multi-Output Device already exists."
+        MULTI_OUTPUT_OK=true
+        return 0
+    fi
+
+    # Create it (must run as the real user for audio session access)
+    log "Creating Multi-Output Device (mirrors speakers → BlackHole)..."
+    local output
+    if output=$(sudo -u "$REAL_USER" "$swift_bin" 2>&1); then
+        echo "$output" | while IFS= read -r line; do log "  $line"; done
+        MULTI_OUTPUT_OK=true
+    else
+        echo "$output" | while IFS= read -r line; do warn "  $line"; done
+        warn "Multi-Output Device creation failed."
+        warn "You can create it manually in Audio MIDI Setup:"
+        warn "  1. Open /Applications/Utilities/Audio MIDI Setup.app"
+        warn "  2. Click '+' → Create Multi-Output Device"
+        warn "  3. Check your speakers AND BlackHole 2ch"
+        warn "  4. Set the Multi-Output Device as your system output"
+        return 1
+    fi
+
+    rm -f "$swift_bin"
+    return 0
+}
+
+setup_multi_output
+echo ""
+
+# ─── Step 6: Ensure launchd service is running ────────────────
 
 ensure_service() {
     if [ "$BINARY_OK" != true ]; then
@@ -439,18 +513,26 @@ ensure_service() {
         return 1
     fi
 
+    local REAL_UID
+    REAL_UID=$(id -u "$REAL_USER")
+
     # Clean up stale socket (exists but no process behind it)
     if [ -S /tmp/audio-driver.sock ]; then
-        # Check if something is actually listening
         if ! lsof /tmp/audio-driver.sock &>/dev/null; then
             warn "Stale socket found. Removing /tmp/audio-driver.sock"
             rm -f /tmp/audio-driver.sock
         fi
     fi
 
+    # Migrate: remove old system-level LaunchDaemon if present
+    if [ -f "$OLD_PLIST_PATH" ]; then
+        log "Migrating from system daemon to user agent..."
+        launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+        rm -f "$OLD_PLIST_PATH"
+    fi
+
     # Check if the service is already running and healthy
-    # BUT if the binary was just updated, force a restart to pick up the new code
-    if [ "$BINARY_UPDATED" != true ] && launchctl print system/"${PLIST_LABEL}" &>/dev/null && [ -S /tmp/audio-driver.sock ]; then
+    if [ "$BINARY_UPDATED" != true ] && sudo -u "$REAL_USER" launchctl print "gui/${REAL_UID}/${PLIST_LABEL}" &>/dev/null && [ -S /tmp/audio-driver.sock ]; then
         log "Service is already running and socket is live."
         SERVICE_OK=true
         return 0
@@ -460,7 +542,11 @@ ensure_service() {
         log "Binary was updated — restarting service to pick up new version..."
     fi
 
-    # Write or update the plist
+    # Ensure LaunchAgents directory exists
+    mkdir -p "$PLIST_DIR"
+    chown "${REAL_USER}" "$PLIST_DIR"
+
+    # Write or update the plist (LaunchAgent — runs as user for CoreAudio access)
     cat > "$PLIST_PATH" << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -487,21 +573,20 @@ ensure_service() {
 PLISTEOF
 
     chmod 644 "$PLIST_PATH"
-    chown root:wheel "$PLIST_PATH"
+    chown "${REAL_USER}" "$PLIST_PATH"
 
-    # Stop if registered but unhealthy
-    launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+    # Stop if registered
+    sudo -u "$REAL_USER" launchctl bootout "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null || true
 
-    # Start
-    if launchctl bootstrap system "$PLIST_PATH" 2>/dev/null; then
-        log "Service started."
+    # Start as user agent
+    if sudo -u "$REAL_USER" launchctl bootstrap "gui/${REAL_UID}" "$PLIST_PATH" 2>/dev/null; then
+        log "Service started (as user: ${REAL_USER})."
     else
-        # bootstrap can fail if already loaded — try kickstart
-        if launchctl kickstart -k system/"${PLIST_LABEL}" 2>/dev/null; then
-            log "Service restarted."
+        if sudo -u "$REAL_USER" launchctl kickstart -k "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null; then
+            log "Service restarted (as user: ${REAL_USER})."
         else
-            error "Failed to start launchd service."
-            error "Try manually: sudo launchctl bootstrap system ${PLIST_PATH}"
+            error "Failed to start user agent."
+            error "Try manually: launchctl bootstrap gui/\$(id -u) ${PLIST_PATH}"
             return 1
         fi
     fi
@@ -518,11 +603,9 @@ PLISTEOF
         tries=$((tries + 1))
     done
 
-    # Socket didn't appear — check if process is at least running
-    if launchctl print system/"${PLIST_LABEL}" &>/dev/null; then
+    if sudo -u "$REAL_USER" launchctl print "gui/${REAL_UID}/${PLIST_LABEL}" &>/dev/null; then
         warn "Service is running but socket not yet available."
         warn "Check logs: cat /tmp/audio-driver.log"
-        # Still mark as OK if the process is alive — socket may need BlackHole
         SERVICE_OK=true
         return 0
     fi
@@ -548,6 +631,12 @@ elif [ "$SKIP_BLACKHOLE" = true ]; then
 else
     error "  BlackHole 2ch .......... FAILED"
     FAILURES=$((FAILURES + 1))
+fi
+
+if [ "$MULTI_OUTPUT_OK" = true ]; then
+    log "  Multi-Output Device .... OK  (Sulla Audio Mirror)"
+else
+    warn "  Multi-Output Device .... MANUAL SETUP NEEDED"
 fi
 
 if [ "$BINARY_OK" = true ]; then
@@ -582,6 +671,6 @@ log "  audio-driver --list-devices       List audio devices"
 log "  audio-driver --configure          Set up gateway mode (credentials)"
 echo ""
 log "Service management:"
-log "  sudo launchctl kickstart -k system/${PLIST_LABEL}   Restart"
-log "  sudo launchctl bootout system/${PLIST_LABEL}        Stop"
-log "  cat /tmp/audio-driver.log                           View logs"
+log "  launchctl kickstart -k gui/\$(id -u)/${PLIST_LABEL}   Restart"
+log "  launchctl bootout gui/\$(id -u)/${PLIST_LABEL}        Stop"
+log "  cat /tmp/audio-driver.log                              View logs"

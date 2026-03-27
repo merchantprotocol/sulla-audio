@@ -185,14 +185,41 @@ private:
             self->audioUnit_, ioActionFlags, inTimeStamp, inBusNumber,
             inNumberFrames, bufferList
         );
-        if (status != noErr) return status;
+        if (status != noErr) {
+            // Log render errors (throttled — once per second at most)
+            static uint64_t lastErrorLog = 0;
+            auto now = static_cast<uint64_t>(inTimeStamp->mSampleTime);
+            if (now - lastErrorLog > self->format_.sampleRate) {
+                fprintf(stderr, "[CoreAudio] AudioUnitRender failed: %d (bus=%u, frames=%u)\n",
+                    (int)status, (unsigned)inBusNumber, (unsigned)inNumberFrames);
+                lastErrorLog = now;
+            }
+            return status;
+        }
 
         // Interleave channels into a single buffer
         std::vector<float> interleaved(inNumberFrames * channels);
+        float maxSample = 0.0f;
         for (uint32_t frame = 0; frame < inNumberFrames; ++frame) {
             for (uint16_t ch = 0; ch < channels; ++ch) {
-                interleaved[frame * channels + ch] = channelBuffers[ch][frame];
+                float s = channelBuffers[ch][frame];
+                interleaved[frame * channels + ch] = s;
+                float a = s < 0 ? -s : s;
+                if (a > maxSample) maxSample = a;
             }
+        }
+
+        // Log audio level periodically (every ~1 second)
+        static uint64_t callbackCount = 0;
+        static float peakSinceLastLog = 0.0f;
+        if (maxSample > peakSinceLastLog) peakSinceLastLog = maxSample;
+        callbackCount++;
+        uint32_t callbacksPerSecond = self->format_.sampleRate / inNumberFrames;
+        if (callbackCount % callbacksPerSecond == 0) {
+            fprintf(stderr, "[CoreAudio] Level: peak=%.6f frames=%u ch=%u (device=%u)\n",
+                peakSinceLastLog, (unsigned)inNumberFrames, (unsigned)channels,
+                (unsigned)self->deviceId_);
+            peakSinceLastLog = 0.0f;
         }
 
         AudioBuffer audioBuffer(interleaved.data(), inNumberFrames, self->format_);
