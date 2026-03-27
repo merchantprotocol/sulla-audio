@@ -71,7 +71,7 @@ public:
 
 private:
     Level       level_ = Level::Info;
-    std::string tag_   = "sulla-audio";
+    std::string tag_   = "audio-driver";
     std::string logDir_;
     std::ofstream logFile_;
     std::mutex  mutex_;
@@ -109,7 +109,7 @@ private:
         char dateBuf[32];
         std::strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", tm);
 
-        std::string path = logDir_ + "/sulla-audio-" + dateBuf + ".log";
+        std::string path = logDir_ + "/audio-driver-" + dateBuf + ".log";
         logFile_.open(path, std::ios::app);
     }
 

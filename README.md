@@ -1,6 +1,6 @@
-# Sulla Audio
+# Audio Driver
 
-Cross-platform audio loopback driver for [Sulla](https://github.com/merchantprotocol). Captures system audio on macOS (CoreAudio + BlackHole) and Windows (WASAPI loopback).
+Cross-platform audio loopback driver. Captures system audio on macOS (CoreAudio + BlackHole) and Windows (WASAPI loopback).
 
 ## Quick Install
 
@@ -24,19 +24,19 @@ curl -fsSL https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main/i
 | Mode | Auth | Transport | Use Case |
 |------|------|-----------|----------|
 | **Gateway** | JWT (email + password) | WebSocket to enterprise gateway | Standalone deployment |
-| **Local** | None | Unix socket / named pipe | Sulla Desktop on same machine |
+| **Local** | None | Unix socket / named pipe | Desktop app on same machine |
 
 ## Usage
 
 ```bash
 # Gateway mode (standalone)
-sulla-audio-driver --mode gateway --backend-url https://api.example.com --email you@example.com
+audio-driver --mode gateway --backend-url https://api.example.com --email you@example.com
 
-# Local mode (with Sulla Desktop)
-sulla-audio-driver --mode local
+# Local mode (with desktop app)
+audio-driver --mode local
 
 # List audio devices
-sulla-audio-driver --list-devices
+audio-driver --list-devices
 ```
 
 ## Build from Source
@@ -49,7 +49,7 @@ cmake ..
 cmake --build .
 
 # Run tests (98 tests)
-./sulla-audio-tests
+./audio-driver-tests
 ```
 
 ## Project Structure

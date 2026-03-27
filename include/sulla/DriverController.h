@@ -194,7 +194,7 @@ public:
             : ChannelMap::singleChannel();
 
         session_ = gatewayClient_->createSession(
-            config_.sessionEndpoint(), auth_, "Sulla Audio Driver", channelMap);
+            config_.sessionEndpoint(), auth_, "Audio Driver", channelMap);
 
         if (!session_.isValid()) {
             SULLA_LOG_ERROR("Gateway", "Failed to create session");

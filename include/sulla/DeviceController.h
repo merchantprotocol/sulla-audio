@@ -101,7 +101,7 @@ private:
         }
         return {{}, false,
             "No virtual audio device found. "
-            "Install SullaAudio driver or BlackHole for system audio capture. "
+            "Install audio driver or BlackHole for system audio capture. "
             "See: https://github.com/ExistentialAudio/BlackHole"
         };
     }

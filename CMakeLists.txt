@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sulla-audio VERSION 0.1.0 LANGUAGES CXX)
+project(audio-driver VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,35 +9,35 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # ─── Platform detection ───────────────────────────────────────
 if(APPLE)
-    set(SULLA_PLATFORM "macos")
+    set(AUDIO_DRIVER_PLATFORM "macos")
     find_library(COREAUDIO_LIB CoreAudio)
     find_library(AUDIOTOOLBOX_LIB AudioToolbox)
     find_library(COREFOUNDATION_LIB CoreFoundation)
     set(PLATFORM_LIBS ${COREAUDIO_LIB} ${AUDIOTOOLBOX_LIB} ${COREFOUNDATION_LIB})
 elseif(WIN32)
-    set(SULLA_PLATFORM "windows")
+    set(AUDIO_DRIVER_PLATFORM "windows")
     set(PLATFORM_LIBS ole32 uuid)
 else()
-    message(FATAL_ERROR "Unsupported platform. sulla-audio requires macOS or Windows.")
+    message(FATAL_ERROR "Unsupported platform. audio-driver requires macOS or Windows.")
 endif()
 
 # ─── Library (models, utils, platform) ────────────────────────
-add_library(sulla-audio-core STATIC
+add_library(audio-driver-core STATIC
     src/platform/PlatformFactory.cpp
 )
-target_include_directories(sulla-audio-core PUBLIC include)
-target_link_libraries(sulla-audio-core ${PLATFORM_LIBS})
+target_include_directories(audio-driver-core PUBLIC include)
+target_link_libraries(audio-driver-core ${PLATFORM_LIBS})
 
 # ─── Driver executable ────────────────────────────────────────
-add_executable(sulla-audio-driver
+add_executable(audio-driver
     src/main.cpp
 )
-target_link_libraries(sulla-audio-driver sulla-audio-core ${PLATFORM_LIBS})
+target_link_libraries(audio-driver audio-driver-core ${PLATFORM_LIBS})
 
 # ─── Tests ────────────────────────────────────────────────────
-option(SULLA_BUILD_TESTS "Build unit tests" ON)
+option(BUILD_TESTS "Build unit tests" ON)
 
-if(SULLA_BUILD_TESTS)
+if(BUILD_TESTS)
     enable_testing()
 
     # Fetch GoogleTest
@@ -49,7 +49,7 @@ if(SULLA_BUILD_TESTS)
     )
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(sulla-audio-tests
+    add_executable(audio-driver-tests
         tests/test_AudioFormat.cpp
         tests/test_AudioBuffer.cpp
         tests/test_RingBuffer.cpp
@@ -62,19 +62,19 @@ if(SULLA_BUILD_TESTS)
         tests/test_AudioChunk.cpp
         tests/test_Logger.cpp
     )
-    target_link_libraries(sulla-audio-tests
-        sulla-audio-core
+    target_link_libraries(audio-driver-tests
+        audio-driver-core
         GTest::gtest_main
         ${PLATFORM_LIBS}
     )
-    target_include_directories(sulla-audio-tests PRIVATE include)
+    target_include_directories(audio-driver-tests PRIVATE include)
 
     include(GoogleTest)
-    gtest_discover_tests(sulla-audio-tests)
+    gtest_discover_tests(audio-driver-tests)
 endif()
 
 # ─── Install ──────────────────────────────────────────────────
-install(TARGETS sulla-audio-driver DESTINATION bin)
+install(TARGETS audio-driver DESTINATION bin)
 
 # macOS: BlackHole virtual audio device is an external dependency.
 # Install via: brew install --cask blackhole-2ch

@@ -8,7 +8,7 @@
 namespace sulla {
 
 /**
- * DriverConfig — persistent configuration for the Sulla Audio driver.
+ * DriverConfig — persistent configuration for the audio driver.
  *
  * Pure data + serialization. No business decisions.
  *
@@ -17,8 +17,8 @@ namespace sulla {
  *   - Local mode:    Sulla Desktop on same machine, streams via local IPC (no auth needed)
  *
  * Persisted as a simple key=value file at a platform-appropriate path:
- *   macOS:   ~/Library/Application Support/SullaAudio/config.ini
- *   Windows: %APPDATA%\SullaAudio\config.ini
+ *   macOS:   ~/Library/Application Support/AudioDriver/config.ini
+ *   Windows: %APPDATA%\AudioDriver\config.ini
  *
  * Security: passwords and tokens are NEVER serialized to the config file.
  * The user enters credentials at runtime (via CLI prompt or config UI).
@@ -97,9 +97,9 @@ struct DriverConfig {
     /** Default local socket path for this platform. */
     static std::string defaultLocalSocket() {
 #if defined(__APPLE__) || defined(__linux__)
-        return "/tmp/sulla-audio.sock";
+        return "/tmp/audio-driver.sock";
 #elif defined(_WIN32)
-        return "\\\\.\\pipe\\sulla-audio";
+        return "\\\\.\\pipe\\audio-driver";
 #endif
         return "";
     }
@@ -174,13 +174,13 @@ struct DriverConfig {
     static std::string configDir() {
 #if defined(__APPLE__)
         const char* home = std::getenv("HOME");
-        return std::string(home ? home : "/tmp") + "/Library/Application Support/SullaAudio";
+        return std::string(home ? home : "/tmp") + "/Library/Application Support/AudioDriver";
 #elif defined(_WIN32)
         const char* appdata = std::getenv("APPDATA");
-        return std::string(appdata ? appdata : "C:\\") + "\\SullaAudio";
+        return std::string(appdata ? appdata : "C:\\") + "\\AudioDriver";
 #else
         const char* home = std::getenv("HOME");
-        return std::string(home ? home : "/tmp") + "/.config/sulla-audio";
+        return std::string(home ? home : "/tmp") + "/.config/audio-driver";
 #endif
     }
 

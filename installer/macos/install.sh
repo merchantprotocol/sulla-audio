@@ -1,14 +1,14 @@
 #!/bin/bash
 #
-# SullaAudio driver installer for macOS.
+# AudioDriver driver installer for macOS.
 #
 # Installs:
 #   1. BlackHole 2ch virtual audio device (external dependency, GPLv3)
-#   2. sulla-audio-driver binary → /usr/local/bin/
-#   3. Config directory → ~/Library/Application Support/SullaAudio/
+#   2. audio-driver-driver binary → /usr/local/bin/
+#   3. Config directory → ~/Library/Application Support/AudioDriver/
 #
 # BlackHole is required on macOS for system audio loopback capture.
-# It is installed as a separate package — not bundled with sulla-audio.
+# It is installed as a separate package — not bundled with audio-driver.
 #
 # Usage:
 #   sudo ./install.sh
@@ -23,9 +23,9 @@ BLACKHOLE_PKG_URL="https://existential.audio/downloads/BlackHole2ch-${BLACKHOLE_
 BLACKHOLE_PKG_ID="audio.existential.BlackHole2ch"
 BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c1988"
 
-BINARY_NAME="sulla-audio-driver"
+BINARY_NAME="audio-driver-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
-CONFIG_DIR="${HOME}/Library/Application Support/SullaAudio"
+CONFIG_DIR="${HOME}/Library/Application Support/AudioDriver"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Colors
@@ -35,10 +35,10 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log()   { echo -e "${GREEN}[sulla-audio]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[sulla-audio]${NC} $1"; }
-error() { echo -e "${RED}[sulla-audio]${NC} $1" >&2; }
-info()  { echo -e "${CYAN}[sulla-audio]${NC} $1"; }
+log()   { echo -e "${GREEN}[audio-driver]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[audio-driver]${NC} $1"; }
+error() { echo -e "${RED}[audio-driver]${NC} $1" >&2; }
+info()  { echo -e "${CYAN}[audio-driver]${NC} $1"; }
 
 # ─── Check for BlackHole ─────────────────────────────────────
 
@@ -121,7 +121,7 @@ install_blackhole() {
 # ─── Uninstall ────────────────────────────────────────────────
 
 if [ "$1" = "--uninstall" ]; then
-    log "Uninstalling SullaAudio..."
+    log "Uninstalling AudioDriver..."
 
     if [ -f "$BINARY_DEST" ]; then
         rm -f "$BINARY_DEST"
@@ -157,7 +157,7 @@ for arg in "$@"; do
     fi
 done
 
-log "Installing SullaAudio driver..."
+log "Installing AudioDriver driver..."
 echo ""
 
 # 1. Install BlackHole (external dependency)
@@ -170,7 +170,7 @@ if [ "$SKIP_BLACKHOLE" = false ]; then
 fi
 
 # 2. Install binary
-BINARY_SOURCE="${SCRIPT_DIR}/../../build/sulla-audio-driver"
+BINARY_SOURCE="${SCRIPT_DIR}/../../build/audio-driver-driver"
 if [ -f "$BINARY_SOURCE" ]; then
     log "Installing driver binary to ${BINARY_DEST}..."
     mkdir -p "$(dirname "$BINARY_DEST")"
@@ -184,7 +184,7 @@ fi
 
 # 3. Create config directory
 REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
-REAL_CONFIG="${REAL_HOME}/Library/Application Support/SullaAudio"
+REAL_CONFIG="${REAL_HOME}/Library/Application Support/AudioDriver"
 if [ ! -d "$REAL_CONFIG" ]; then
     mkdir -p "$REAL_CONFIG"
     chown -R "${SUDO_USER:-$USER}" "$REAL_CONFIG"
@@ -242,10 +242,10 @@ log "Installation complete!"
 echo ""
 log "Next steps:"
 log "  Gateway mode (standalone):"
-log "    sulla-audio-driver --mode gateway --backend-url https://api.example.com --email you@example.com"
+log "    audio-driver-driver --mode gateway --backend-url https://api.example.com --email you@example.com"
 log ""
 log "  Local mode (with Sulla Desktop):"
-log "    sulla-audio-driver --mode local"
+log "    audio-driver-driver --mode local"
 log ""
 log "  List devices:"
-log "    sulla-audio-driver --list-devices"
+log "    audio-driver-driver --list-devices"

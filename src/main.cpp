@@ -1,5 +1,5 @@
 /**
- * sulla-audio-driver — standalone system audio capture agent.
+ * audio-driver — standalone system audio capture agent.
  *
  * Dual-mode operation:
  *   Gateway mode: Authenticates via email/password, streams mic + speaker
@@ -7,13 +7,13 @@
  *   Local mode:   Streams via local IPC to Sulla Desktop (no auth needed).
  *
  * Usage:
- *   sulla-audio-driver                         # Uses saved config
- *   sulla-audio-driver --list-devices          # Lists available audio devices
- *   sulla-audio-driver --mode gateway          # Gateway mode (default)
- *   sulla-audio-driver --mode local            # Local mode (Sulla Desktop)
- *   sulla-audio-driver --backend-url URL       # Backend API URL
- *   sulla-audio-driver --email EMAIL           # Login email
- *   sulla-audio-driver --device ID             # Preferred audio device
+ *   audio-driver                         # Uses saved config
+ *   audio-driver --list-devices          # Lists available audio devices
+ *   audio-driver --mode gateway          # Gateway mode (default)
+ *   audio-driver --mode local            # Local mode (Sulla Desktop)
+ *   audio-driver --backend-url URL       # Backend API URL
+ *   audio-driver --email EMAIL           # Login email
+ *   audio-driver --device ID             # Preferred audio device
  */
 
 #include <sulla/DriverConfig.h>
@@ -118,7 +118,7 @@ void listDevices() {
         }
         if (!hasVirtual) {
             std::cout << "  No virtual audio device found.\n"
-                      << "  Install SullaAudioDevice.driver or BlackHole for loopback capture.\n\n";
+                      << "  Install BlackHole.driver or BlackHole for loopback capture.\n\n";
         }
     }
 }
@@ -158,7 +158,7 @@ void configure(sulla::DriverConfig& config, int argc, char* argv[]) {
 }
 
 int runDriver(sulla::DriverConfig& config) {
-    std::cout << "sulla-audio-driver v0.1.0 (" << sulla::PlatformDetector::osName() << ")\n";
+    std::cout << "audio-driver v0.1.0 (" << sulla::PlatformDetector::osName() << ")\n";
     std::cout << "Mode: " << (config.isGatewayMode() ? "gateway" : "local") << "\n";
 
     // Build the object graph
@@ -250,21 +250,21 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         if (arg == "--help" || arg == "-h") {
-            std::cout << "sulla-audio-driver — system audio capture agent\n\n"
+            std::cout << "audio-driver — system audio capture agent\n\n"
                       << "Usage:\n"
-                      << "  sulla-audio-driver                        Start streaming\n"
-                      << "  sulla-audio-driver --list-devices         List audio devices\n"
-                      << "  sulla-audio-driver --mode gateway|local   Set operating mode\n"
-                      << "  sulla-audio-driver --backend-url URL      Backend API URL\n"
-                      << "  sulla-audio-driver --email EMAIL          Login email\n"
-                      << "  sulla-audio-driver --gateway-url URL      Override gateway WS URL\n"
-                      << "  sulla-audio-driver --socket PATH          Local socket path\n"
-                      << "  sulla-audio-driver --local-port PORT      Local TCP port\n"
-                      << "  sulla-audio-driver --device ID            Preferred audio device\n"
-                      << "  sulla-audio-driver --chunk-ms MS          Chunk interval (default: 200)\n"
-                      << "  sulla-audio-driver --log-level LEVEL      trace|debug|info|warn|error\n"
-                      << "  sulla-audio-driver --no-mic               Disable mic capture\n"
-                      << "  sulla-audio-driver --no-auto-start        Don't auto-start\n"
+                      << "  audio-driver                        Start streaming\n"
+                      << "  audio-driver --list-devices         List audio devices\n"
+                      << "  audio-driver --mode gateway|local   Set operating mode\n"
+                      << "  audio-driver --backend-url URL      Backend API URL\n"
+                      << "  audio-driver --email EMAIL          Login email\n"
+                      << "  audio-driver --gateway-url URL      Override gateway WS URL\n"
+                      << "  audio-driver --socket PATH          Local socket path\n"
+                      << "  audio-driver --local-port PORT      Local TCP port\n"
+                      << "  audio-driver --device ID            Preferred audio device\n"
+                      << "  audio-driver --chunk-ms MS          Chunk interval (default: 200)\n"
+                      << "  audio-driver --log-level LEVEL      trace|debug|info|warn|error\n"
+                      << "  audio-driver --no-mic               Disable mic capture\n"
+                      << "  audio-driver --no-auto-start        Don't auto-start\n"
                       << "\nConfig: " << sulla::DriverConfig::configFilePath() << "\n";
             return 0;
         }

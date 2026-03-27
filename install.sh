@@ -1,14 +1,14 @@
 #!/bin/bash
 #
-# SullaAudio cross-platform installer.
+# AudioDriver cross-platform installer.
 #
 # Clones the repo to a temp directory, detects the OS,
 # and runs the appropriate platform installer.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main/install.sh | sudo bash
-#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main/install.sh | sudo bash -s -- --uninstall
-#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/sulla-audio/main/install.sh | sudo bash -s -- --skip-blackhole
+#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/audio-driver/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/audio-driver/main/install.sh | sudo bash -s -- --uninstall
+#   curl -fsSL https://raw.githubusercontent.com/merchantprotocol/audio-driver/main/install.sh | sudo bash -s -- --skip-blackhole
 #
 # Or run locally:
 #   sudo ./install.sh
@@ -16,18 +16,18 @@
 
 set -e
 
-REPO_URL="https://github.com/merchantprotocol/sulla-audio.git"
+REPO_URL="https://github.com/merchantprotocol/audio-driver.git"
 CLONE_DIR="/tmp/.audio-driver"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-log()   { echo -e "${GREEN}[sulla-audio]${NC} $1"; }
-error() { echo -e "${RED}[sulla-audio]${NC} $1" >&2; }
+log()   { echo -e "${GREEN}[audio-driver]${NC} $1"; }
+error() { echo -e "${RED}[audio-driver]${NC} $1" >&2; }
 
 # Clone or update the repo (close stdin so git doesn't hang when piped from curl)
-log "Downloading sulla-audio..."
+log "Downloading audio-driver..."
 if [ -d "$CLONE_DIR/.git" ]; then
     git -C "$CLONE_DIR" pull --ff-only </dev/null 2>/dev/null || true
 else

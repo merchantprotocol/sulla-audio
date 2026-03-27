@@ -17,7 +17,7 @@ namespace sulla {
 /**
  * CoreAudioCaptureBackend — captures audio from a virtual input device on macOS.
  *
- * On macOS, loopback capture requires a virtual audio device (BlackHole, SullaAudio)
+ * On macOS, loopback capture requires a virtual audio device (BlackHole, AudioDriver)
  * that routes system output to an input tap. This backend opens that device's input
  * stream and delivers raw PCM buffers via the data callback.
  *

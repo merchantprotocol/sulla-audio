@@ -34,7 +34,7 @@ TEST(DriverConfig, HasLocalConfig) {
     DriverConfig cfg;
     EXPECT_FALSE(cfg.hasLocalConfig());
 
-    cfg.localSocketPath = "/tmp/sulla-audio.sock";
+    cfg.localSocketPath = "/tmp/audio-driver.sock";
     EXPECT_TRUE(cfg.hasLocalConfig());
 
     cfg.localSocketPath.clear();
@@ -81,7 +81,7 @@ TEST(DriverConfig, SerializeDeserializeGateway) {
 TEST(DriverConfig, SerializeDeserializeLocal) {
     DriverConfig original;
     original.mode = DriverConfig::Mode::Local;
-    original.localSocketPath = "/tmp/sulla-audio.sock";
+    original.localSocketPath = "/tmp/audio-driver.sock";
     original.localPort = 8080;
 
     std::string serialized = original.serialize();
