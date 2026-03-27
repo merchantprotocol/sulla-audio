@@ -1,0 +1,402 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <functional>
+#include <atomic>
+
+#include "DriverConfig.h"
+#include "DeviceController.h"
+#include "CaptureController.h"
+#include "IGatewayClient.h"
+#include "IAuthClient.h"
+#include "ILocalTransport.h"
+#include "AuthCredentials.h"
+#include "GatewaySession.h"
+#include "AudioChunk.h"
+#include "CaptureState.h"
+#include "PlatformDetector.h"
+#include "Logger.h"
+
+namespace sulla {
+
+/**
+ * DriverController — top-level controller that wires everything together.
+ *
+ * Business decisions:
+ *   - Mode selection: gateway (standalone + auth) vs local (Sulla Desktop IPC)
+ *   - Auth lifecycle: login, token refresh, re-auth on expiry
+ *   - Device selection delegation to DeviceController
+ *   - Chunk routing: gateway WebSocket vs local transport vs both
+ *   - Reconnection logic on disconnect
+ *   - Logging: what to log, what to redact
+ *
+ * Gateway mode flow:
+ *   1. Login (email + password → JWT token + userId)
+ *   2. Derive gateway WebSocket URL from backend
+ *   3. Select capture device (DeviceController)
+ *   4. Create gateway session (POST /api/sessions with auth header)
+ *   5. Connect audio WebSocket (auth in header, not URL)
+ *   6. Capture mic + speaker → labeled chunks → gateway
+ *
+ * Local mode flow:
+ *   1. No auth
+ *   2. Start local transport server (Unix socket / named pipe)
+ *   3. Select capture device (DeviceController)
+ *   4. Capture mic + speaker → labeled chunks → local transport
+ *   5. Sulla Desktop connects, receives chunks, routes through SecretaryMode
+ */
+class DriverController {
+public:
+    enum class DriverState {
+        Unconfigured,
+        Authenticating,
+        Ready,
+        Connecting,
+        Streaming,
+        Reconnecting,
+        Error
+    };
+
+    using StatusCallback = std::function<void(DriverState state, const std::string& message)>;
+
+    DriverController(
+        std::unique_ptr<DeviceController> deviceCtrl,
+        std::unique_ptr<CaptureController> speakerCapture,
+        std::unique_ptr<CaptureController> micCapture,
+        std::unique_ptr<IGatewayClient> gatewayClient,
+        std::unique_ptr<IAuthClient> authClient,
+        std::unique_ptr<ILocalTransport> localTransport
+    )
+        : deviceCtrl_(std::move(deviceCtrl))
+        , speakerCapture_(std::move(speakerCapture))
+        , micCapture_(std::move(micCapture))
+        , gatewayClient_(std::move(gatewayClient))
+        , authClient_(std::move(authClient))
+        , localTransport_(std::move(localTransport))
+    {}
+
+    void onStatus(StatusCallback cb) { statusCallback_ = std::move(cb); }
+
+    // ─── Configuration ───────────────────────────────────────
+
+    /**
+     * Apply config and auto-start if ready.
+     * In gateway mode, auth must happen before streaming.
+     */
+    void applyConfig(const DriverConfig& config) {
+        config_ = config;
+
+        // Initialize logging
+        auto& log = Logger::instance();
+        log.setLogDir(DriverConfig::logDir());
+        if (config.logLevel == "trace")     log.setLevel(Logger::Level::Trace);
+        else if (config.logLevel == "debug") log.setLevel(Logger::Level::Debug);
+        else if (config.logLevel == "warn")  log.setLevel(Logger::Level::Warn);
+        else if (config.logLevel == "error") log.setLevel(Logger::Level::Error);
+        else                                  log.setLevel(Logger::Level::Info);
+
+        SULLA_LOG_INFO("Driver", "Config applied — mode: "
+            + std::string(config.isGatewayMode() ? "gateway" : "local")
+            + ", platform: " + PlatformDetector::osName());
+
+        if (config.isGatewayMode()) {
+            if (!config.hasGatewayConfig()) {
+                setState(DriverState::Unconfigured,
+                    "Gateway mode requires backend_url and email");
+                return;
+            }
+            setState(DriverState::Ready, "Configured — login required before streaming");
+        } else {
+            if (!config.hasLocalConfig()) {
+                config_.localSocketPath = DriverConfig::defaultLocalSocket();
+                SULLA_LOG_INFO("Driver", "Using default local socket: " + config_.localSocketPath);
+            }
+            setState(DriverState::Ready, "Local mode — no auth required");
+
+            if (config.autoStart) {
+                startLocal();
+            }
+        }
+    }
+
+    // ─── Gateway mode ────────────────────────────────────────
+
+    /**
+     * Authenticate with the backend. Must be called before startGateway().
+     * Password is provided at runtime, never persisted.
+     */
+    void login(const std::string& password) {
+        if (!config_.isGatewayMode()) {
+            SULLA_LOG_WARN("Driver", "login() called but not in gateway mode");
+            return;
+        }
+
+        setState(DriverState::Authenticating, "Logging in as " + config_.email + "...");
+        SULLA_LOG_INFO("Auth", "Authenticating: " + config_.email + " → " + config_.authEndpoint());
+
+        auto result = authClient_->login(config_.backendUrl, config_.email, password);
+
+        if (!result.success) {
+            SULLA_LOG_ERROR("Auth", "Login failed: " + result.error);
+            setState(DriverState::Error, "Login failed: " + result.error);
+            return;
+        }
+
+        auth_ = result.credentials;
+        SULLA_LOG_INFO("Auth", "Login successful — " + auth_.redacted());
+
+        // Derive gateway URL from backend if not explicitly set
+        if (config_.gatewayUrl.empty()) {
+            // Convert http(s)://host:port/api/ → ws(s)://host:port
+            std::string url = config_.backendUrl;
+            if (url.find("https://") == 0)    url = "wss://" + url.substr(8);
+            else if (url.find("http://") == 0) url = "ws://" + url.substr(7);
+            // Strip trailing /api/ or /api
+            auto apiPos = url.rfind("/api");
+            if (apiPos != std::string::npos) url = url.substr(0, apiPos);
+            config_.gatewayUrl = url;
+            SULLA_LOG_INFO("Auth", "Derived gateway URL: " + config_.gatewayUrl);
+        }
+
+        setState(DriverState::Ready, "Authenticated — ready to stream");
+
+        if (config_.autoStart) {
+            startGateway();
+        }
+    }
+
+    /**
+     * Start streaming to the gateway (requires prior login).
+     */
+    void startGateway() {
+        if (!auth_.isAuthenticated()) {
+            setState(DriverState::Error, "Not authenticated — call login() first");
+            return;
+        }
+
+        setState(DriverState::Connecting, "Selecting audio device...");
+
+        // Step 1: Device selection
+        auto selection = deviceCtrl_->selectDevice(config_.preferredDevice);
+        if (!selection.found) {
+            SULLA_LOG_ERROR("Device", selection.message);
+            setState(DriverState::Error, selection.message);
+            return;
+        }
+        selectedDevice_ = selection.device;
+        SULLA_LOG_INFO("Device", "Selected: " + selection.device.toString());
+
+        // Step 2: Create gateway session
+        setState(DriverState::Connecting, "Creating gateway session...");
+        auto channelMap = (config_.captureMic && config_.captureSpeaker)
+            ? ChannelMap::dualChannel()
+            : ChannelMap::singleChannel();
+
+        session_ = gatewayClient_->createSession(
+            config_.sessionEndpoint(), auth_, "Sulla Audio Driver", channelMap);
+
+        if (!session_.isValid()) {
+            SULLA_LOG_ERROR("Gateway", "Failed to create session");
+            setState(DriverState::Error, "Gateway session creation failed");
+            return;
+        }
+        SULLA_LOG_INFO("Gateway", "Session created: " + session_.sessionId);
+
+        // Step 3: Connect audio WebSocket (token in header)
+        if (!gatewayClient_->connectAudio(session_.audioUrl, auth_)) {
+            SULLA_LOG_ERROR("Gateway", "Audio WebSocket connection failed");
+            setState(DriverState::Error, "Audio WebSocket connection failed");
+            return;
+        }
+        SULLA_LOG_INFO("Gateway", "Audio WebSocket connected");
+
+        // Step 4: Wire captures to gateway
+        wireCapturesToGateway();
+
+        // Step 5: Start capture
+        startCapture();
+    }
+
+    // ─── Local mode ──────────────────────────────────────────
+
+    /**
+     * Start local transport server and begin capturing.
+     * Sulla Desktop connects and receives labeled chunks.
+     */
+    void startLocal() {
+        setState(DriverState::Connecting, "Starting local transport...");
+
+        if (!localTransport_->startServer(config_.localSocketPath, config_.localPort)) {
+            SULLA_LOG_ERROR("Local", "Failed to start local transport server");
+            setState(DriverState::Error, "Local transport server failed to start");
+            return;
+        }
+        SULLA_LOG_INFO("Local", "Local transport listening on " + config_.localSocketPath);
+
+        // Device selection
+        auto selection = deviceCtrl_->selectDevice(config_.preferredDevice);
+        if (!selection.found) {
+            SULLA_LOG_ERROR("Device", selection.message);
+            setState(DriverState::Error, selection.message);
+            return;
+        }
+        selectedDevice_ = selection.device;
+        SULLA_LOG_INFO("Device", "Selected: " + selection.device.toString());
+
+        // Wire captures to local transport
+        wireCapturesToLocal();
+
+        // Start capture
+        startCapture();
+    }
+
+    // ─── Shared ──────────────────────────────────────────────
+
+    void stop() {
+        SULLA_LOG_INFO("Driver", "Stopping...");
+
+        if (speakerCapture_) speakerCapture_->stop();
+        if (micCapture_) micCapture_->stop();
+
+        if (config_.isGatewayMode()) {
+            gatewayClient_->disconnectAudio();
+        } else {
+            localTransport_->stopServer();
+        }
+
+        setState(DriverState::Ready, "Stopped");
+        SULLA_LOG_INFO("Driver", "Stopped");
+    }
+
+    DriverState state() const { return state_; }
+    const GatewaySession& session() const { return session_; }
+    const AudioDevice& device() const { return selectedDevice_; }
+    const DriverConfig& config() const { return config_; }
+    const AuthCredentials& auth() const { return auth_; }
+
+private:
+    std::unique_ptr<DeviceController>  deviceCtrl_;
+    std::unique_ptr<CaptureController> speakerCapture_;
+    std::unique_ptr<CaptureController> micCapture_;
+    std::unique_ptr<IGatewayClient>    gatewayClient_;
+    std::unique_ptr<IAuthClient>       authClient_;
+    std::unique_ptr<ILocalTransport>   localTransport_;
+
+    DriverConfig    config_;
+    AuthCredentials auth_;
+    GatewaySession  session_;
+    AudioDevice     selectedDevice_;
+    DriverState     state_ = DriverState::Unconfigured;
+    StatusCallback  statusCallback_;
+
+    uint32_t speakerChunkCount_ = 0;
+    uint32_t micChunkCount_ = 0;
+
+    void wireCapturesToGateway() {
+        speakerCapture_->onChunk([this](const std::vector<uint8_t>& raw) {
+            AudioChunk chunk;
+            chunk.source = AudioChunk::Source::Speaker;
+            chunk.audio = raw;
+            chunk.sequenceNum = ++speakerChunkCount_;
+
+            if (config_.logAudioDiagnostics && (chunk.sequenceNum <= 5 || chunk.sequenceNum % 100 == 0)) {
+                SULLA_LOG_DEBUG("Capture", chunk.toString());
+            }
+
+            gatewayClient_->sendChunk(chunk);
+        });
+
+        if (config_.captureMic && micCapture_) {
+            micCapture_->onChunk([this](const std::vector<uint8_t>& raw) {
+                AudioChunk chunk;
+                chunk.source = AudioChunk::Source::Mic;
+                chunk.audio = raw;
+                chunk.sequenceNum = ++micChunkCount_;
+
+                if (config_.logAudioDiagnostics && (chunk.sequenceNum <= 5 || chunk.sequenceNum % 100 == 0)) {
+                    SULLA_LOG_DEBUG("Capture", chunk.toString());
+                }
+
+                gatewayClient_->sendChunk(chunk);
+            });
+        }
+    }
+
+    void wireCapturesToLocal() {
+        speakerCapture_->onChunk([this](const std::vector<uint8_t>& raw) {
+            AudioChunk chunk;
+            chunk.source = AudioChunk::Source::Speaker;
+            chunk.audio = raw;
+            chunk.sequenceNum = ++speakerChunkCount_;
+
+            if (config_.logAudioDiagnostics && (chunk.sequenceNum <= 5 || chunk.sequenceNum % 100 == 0)) {
+                SULLA_LOG_DEBUG("Capture", chunk.toString());
+            }
+
+            localTransport_->sendChunk(chunk);
+        });
+
+        if (config_.captureMic && micCapture_) {
+            micCapture_->onChunk([this](const std::vector<uint8_t>& raw) {
+                AudioChunk chunk;
+                chunk.source = AudioChunk::Source::Mic;
+                chunk.audio = raw;
+                chunk.sequenceNum = ++micChunkCount_;
+
+                if (config_.logAudioDiagnostics && (chunk.sequenceNum <= 5 || chunk.sequenceNum % 100 == 0)) {
+                    SULLA_LOG_DEBUG("Capture", chunk.toString());
+                }
+
+                localTransport_->sendChunk(chunk);
+            });
+        }
+    }
+
+    void startCapture() {
+        speakerChunkCount_ = 0;
+        micChunkCount_ = 0;
+
+        // Start speaker capture
+        auto err = speakerCapture_->start(selectedDevice_);
+        if (!err.ok()) {
+            SULLA_LOG_ERROR("Capture", "Speaker capture failed: " + err.message);
+            setState(DriverState::Error, "Speaker capture failed: " + err.message);
+            return;
+        }
+        SULLA_LOG_INFO("Capture", "Speaker capture started on " + selectedDevice_.name);
+
+        // Start mic capture if configured
+        // TODO: mic capture needs a separate device (input device, not output)
+        // For now, mic is only captured if Sulla Desktop provides it (local mode)
+        // or the gateway session was created with dual-channel (gateway mode with mic)
+
+        setState(DriverState::Streaming,
+            "Streaming from " + selectedDevice_.name
+            + (config_.isGatewayMode()
+                ? " → gateway session " + session_.sessionId
+                : " → local transport"));
+        SULLA_LOG_INFO("Driver", "Streaming active");
+    }
+
+    void setState(DriverState state, const std::string& message) {
+        state_ = state;
+        SULLA_LOG_INFO("Driver", "State → " + stateToString(state) + ": " + message);
+        if (statusCallback_) statusCallback_(state, message);
+    }
+
+    static std::string stateToString(DriverState s) {
+        switch (s) {
+            case DriverState::Unconfigured:   return "Unconfigured";
+            case DriverState::Authenticating: return "Authenticating";
+            case DriverState::Ready:          return "Ready";
+            case DriverState::Connecting:     return "Connecting";
+            case DriverState::Streaming:      return "Streaming";
+            case DriverState::Reconnecting:   return "Reconnecting";
+            case DriverState::Error:          return "Error";
+        }
+        return "Unknown";
+    }
+};
+
+} // namespace sulla

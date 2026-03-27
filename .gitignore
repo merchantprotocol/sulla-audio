@@ -1,0 +1,26 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/
+.DS_Store
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Config (may contain credentials)
+*.ini
+
+# Logs
+*.log
