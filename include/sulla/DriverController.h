@@ -135,6 +135,12 @@ public:
         setState(DriverState::Authenticating, "Logging in as " + config_.email + "...");
         SULLA_LOG_INFO("Auth", "Authenticating: " + config_.email + " → " + config_.authEndpoint());
 
+        if (!authClient_) {
+            SULLA_LOG_ERROR("Auth", "Auth client not available (not implemented)");
+            setState(DriverState::Error, "Auth client not available");
+            return;
+        }
+
         auto result = authClient_->login(config_.backendUrl, config_.email, password);
 
         if (!result.success) {
@@ -188,6 +194,12 @@ public:
         SULLA_LOG_INFO("Device", "Selected: " + selection.device.toString());
 
         // Step 2: Create gateway session
+        if (!gatewayClient_) {
+            SULLA_LOG_ERROR("Gateway", "Gateway client not available (not implemented)");
+            setState(DriverState::Error, "Gateway client not available");
+            return;
+        }
+
         setState(DriverState::Connecting, "Creating gateway session...");
         auto channelMap = (config_.captureMic && config_.captureSpeaker)
             ? ChannelMap::dualChannel()
@@ -227,6 +239,12 @@ public:
     void startLocal() {
         setState(DriverState::Connecting, "Starting local transport...");
 
+        if (!localTransport_) {
+            SULLA_LOG_ERROR("Local", "Local transport not available (platform not implemented)");
+            setState(DriverState::Error, "Local transport not available");
+            return;
+        }
+
         if (!localTransport_->startServer(config_.localSocketPath, config_.localPort)) {
             SULLA_LOG_ERROR("Local", "Failed to start local transport server");
             setState(DriverState::Error, "Local transport server failed to start");
@@ -260,9 +278,9 @@ public:
         if (micCapture_) micCapture_->stop();
 
         if (config_.isGatewayMode()) {
-            gatewayClient_->disconnectAudio();
+            if (gatewayClient_) gatewayClient_->disconnectAudio();
         } else {
-            localTransport_->stopServer();
+            if (localTransport_) localTransport_->stopServer();
         }
 
         setState(DriverState::Ready, "Stopped");

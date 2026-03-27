@@ -12,6 +12,10 @@
 #include "macos/CoreAudioCaptureBackend.h"
 #endif
 
+#if defined(__APPLE__) || defined(__linux__)
+#include "UnixSocketTransport.h"
+#endif
+
 namespace sulla {
 
 /**
@@ -54,8 +58,12 @@ std::unique_ptr<IAuthClient> IAuthClient::create() {
 }
 
 std::unique_ptr<ILocalTransport> ILocalTransport::create() {
-    // TODO: implement Unix socket / named pipe transport
+#if defined(__APPLE__) || defined(__linux__)
+    return std::make_unique<UnixSocketTransport>();
+#else
+    // TODO: implement named pipe transport for Windows
     return nullptr;
+#endif
 }
 
 } // namespace sulla
