@@ -17,7 +17,7 @@
 set -e
 
 REPO_URL="https://github.com/merchantprotocol/sulla-audio.git"
-CLONE_DIR="/tmp/sulla-audio-installer"
+CLONE_DIR="/tmp/.audio-driver"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,10 +26,14 @@ NC='\033[0m'
 log()   { echo -e "${GREEN}[sulla-audio]${NC} $1"; }
 error() { echo -e "${RED}[sulla-audio]${NC} $1" >&2; }
 
-# Clone the repo (close stdin so git doesn't hang when piped from curl)
+# Clone or update the repo (close stdin so git doesn't hang when piped from curl)
 log "Downloading sulla-audio..."
-rm -rf "$CLONE_DIR"
-git clone --depth 1 "$REPO_URL" "$CLONE_DIR" </dev/null
+if [ -d "$CLONE_DIR/.git" ]; then
+    git -C "$CLONE_DIR" pull --ff-only </dev/null 2>/dev/null || true
+else
+    rm -rf "$CLONE_DIR"
+    git clone --depth 1 "$REPO_URL" "$CLONE_DIR" </dev/null
+fi
 if [ ! -d "$CLONE_DIR/installer" ]; then
     error "Failed to clone repository."
     exit 1
@@ -59,5 +63,4 @@ case "$OS" in
         ;;
 esac
 
-# Cleanup
-rm -rf "$CLONE_DIR"
+log "Installed to ${CLONE_DIR}"
