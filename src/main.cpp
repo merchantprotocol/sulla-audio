@@ -37,6 +37,16 @@
 #include <thread>
 #include <chrono>
 
+#ifndef AUDIO_DRIVER_VERSION
+#define AUDIO_DRIVER_VERSION "0.1.0"
+#endif
+#ifndef AUDIO_DRIVER_COMMIT
+#define AUDIO_DRIVER_COMMIT "unknown"
+#endif
+#ifndef AUDIO_DRIVER_BUILD_DATE
+#define AUDIO_DRIVER_BUILD_DATE "unknown"
+#endif
+
 static std::atomic<bool> g_running{true};
 
 void signalHandler(int) {
@@ -158,7 +168,8 @@ void configure(sulla::DriverConfig& config, int argc, char* argv[]) {
 }
 
 int runDriver(sulla::DriverConfig& config) {
-    std::cout << "audio-driver v0.1.0 (" << sulla::PlatformDetector::osName() << ")\n";
+    std::cout << "audio-driver v" << AUDIO_DRIVER_VERSION
+              << " (" << AUDIO_DRIVER_COMMIT << ", " << sulla::PlatformDetector::osName() << ")\n";
     std::cout << "Mode: " << (config.isGatewayMode() ? "gateway" : "local") << "\n";
 
     // Build the object graph
@@ -254,6 +265,11 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--list-devices" || arg == "-l") {
             listDevices();
+            return 0;
+        }
+        if (arg == "--version" || arg == "-v") {
+            std::cout << "audio-driver v" << AUDIO_DRIVER_VERSION
+                      << " (" << AUDIO_DRIVER_COMMIT << ", " << AUDIO_DRIVER_BUILD_DATE << ")\n";
             return 0;
         }
         if (arg == "--help" || arg == "-h") {

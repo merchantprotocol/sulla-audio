@@ -28,9 +28,37 @@ add_library(audio-driver-core STATIC
 target_include_directories(audio-driver-core PUBLIC include)
 target_link_libraries(audio-driver-core ${PLATFORM_LIBS})
 
+# ─── Build version from git ───────────────────────────────────
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT GIT_COMMIT_HASH)
+    set(GIT_COMMIT_HASH "unknown")
+endif()
+
+execute_process(
+    COMMAND git log -1 --format=%cd --date=short
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT_DATE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT GIT_COMMIT_DATE)
+    set(GIT_COMMIT_DATE "unknown")
+endif()
+
 # ─── Driver executable ────────────────────────────────────────
 add_executable(audio-driver
     src/main.cpp
+)
+target_compile_definitions(audio-driver PRIVATE
+    AUDIO_DRIVER_VERSION="${PROJECT_VERSION}"
+    AUDIO_DRIVER_COMMIT="${GIT_COMMIT_HASH}"
+    AUDIO_DRIVER_BUILD_DATE="${GIT_COMMIT_DATE}"
 )
 target_link_libraries(audio-driver audio-driver-core ${PLATFORM_LIBS})
 
