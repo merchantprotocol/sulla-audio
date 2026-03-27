@@ -270,13 +270,58 @@ else
     warn "BlackHole not yet visible. A reboot may be required."
 fi
 
+# 6. Register as a launchd service (auto-start on boot)
+PLIST_LABEL="com.audiodriver.agent"
+PLIST_PATH="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
+
+# Stop existing service if running
+launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
+
+cat > "$PLIST_PATH" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${BINARY_DEST}</string>
+        <string>--mode</string>
+        <string>local</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/audio-driver.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/audio-driver.log</string>
+</dict>
+</plist>
+PLISTEOF
+
+chmod 644 "$PLIST_PATH"
+chown root:wheel "$PLIST_PATH"
+
+if [ -f "$BINARY_DEST" ]; then
+    launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || true
+    log "Service registered and started (auto-starts on boot)"
+else
+    warn "Binary not installed — service registered but won't start until binary is available"
+fi
+
 echo ""
 log "Installation complete!"
 echo ""
-log "The driver is ready in local mode — no credentials needed."
-log "Desktop apps can connect via /tmp/audio-driver.sock"
+log "The audio driver is running in local mode."
+log "Desktop apps connect automatically via /tmp/audio-driver.sock"
 echo ""
 log "Commands:"
-log "  audio-driver                      Start (local mode)"
 log "  audio-driver --list-devices       List audio devices"
 log "  audio-driver --configure          Set up gateway mode (credentials)"
+log ""
+log "Service management:"
+log "  sudo launchctl kickstart -k system/${PLIST_LABEL}   Restart"
+log "  sudo launchctl bootout system/${PLIST_LABEL}        Stop"

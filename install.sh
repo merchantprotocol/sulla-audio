@@ -16,7 +16,7 @@
 
 set -e
 
-REPO_URL="https://github.com/merchantprotocol/audio-driver.git"
+REPO_URL="https://github.com/merchantprotocol/sulla-audio.git"
 CLONE_DIR="/tmp/.audio-driver"
 
 RED='\033[0;31m'
