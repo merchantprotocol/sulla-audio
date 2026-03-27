@@ -174,8 +174,12 @@ private:
             // Make sure it's not already our mirror
             std::string uid = getDeviceUID(physicalOutput);
             if (uid == kMirrorUID) {
-                // The mirror is already default — find the physical device inside it
-                // Just keep what we have
+                // Mirror already exists and is default — adopt it
+                AudioDeviceID existing = findDeviceByUID(kMirrorUID);
+                if (existing != kAudioObjectUnknown) {
+                    mirrorId_ = existing;
+                    SULLA_LOG_INFO("Mirror", "Adopted existing mirror device (ID: " + std::to_string(mirrorId_) + ")");
+                }
                 rebuilding_ = false;
                 return true;
             }
@@ -186,8 +190,14 @@ private:
             lastPhysicalOutput_ = physicalOutput;
         }
 
-        // Destroy existing mirror
+        // Destroy existing mirror (including any stale one from a previous run)
         destroyMirrorNoLock();
+        // Also check for orphaned mirror from installer or previous crash
+        AudioDeviceID orphan = findDeviceByUID(kMirrorUID);
+        if (orphan != kAudioObjectUnknown) {
+            SULLA_LOG_INFO("Mirror", "Destroying orphaned mirror device (ID: " + std::to_string(orphan) + ")");
+            AudioHardwareDestroyAggregateDevice(orphan);
+        }
 
         std::string physicalUID = getDeviceUID(physicalOutput);
         std::string physicalName = getDeviceName(physicalOutput);
