@@ -70,6 +70,18 @@ public:
             SULLA_LOG_ERROR("Mirror", "Failed to install output device listener: " + std::to_string(status));
             return false;
         }
+
+        // Also listen for device list changes (connect/disconnect headsets, etc.)
+        // When a sub-device disappears from our mirror, we need to rebuild it
+        AudioObjectPropertyAddress devListAddr = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectAddPropertyListener(
+            kAudioObjectSystemObject, &devListAddr, deviceListChangedCallback, this
+        );
+
         listening_ = true;
         SULLA_LOG_INFO("Mirror", "Listening for output device changes");
 
@@ -90,6 +102,14 @@ public:
             };
             AudioObjectRemovePropertyListener(
                 kAudioObjectSystemObject, &addr, outputChangedCallback, this
+            );
+            AudioObjectPropertyAddress devListAddr = {
+                kAudioHardwarePropertyDevices,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            AudioObjectRemovePropertyListener(
+                kAudioObjectSystemObject, &devListAddr, deviceListChangedCallback, this
             );
             listening_ = false;
         }
@@ -129,6 +149,22 @@ private:
         return noErr;
     }
 
+    /**
+     * CoreAudio callback — fires when devices are added or removed.
+     * Handles headset disconnect where the mirror's sub-device disappears
+     * but the default output doesn't change (it stays on the broken mirror).
+     */
+    static OSStatus deviceListChangedCallback(
+        AudioObjectID /*inObjectID*/,
+        UInt32 /*inNumberAddresses*/,
+        const AudioObjectPropertyAddress* /*inAddresses*/,
+        void* inClientData
+    ) {
+        auto* self = static_cast<AudioMirrorManager*>(inClientData);
+        self->handleDeviceListChange();
+        return noErr;
+    }
+
     void handleOutputChange() {
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -153,6 +189,47 @@ private:
 
         // Rebuild the mirror with the new device
         lastPhysicalOutput_ = currentDefault;
+        rebuildMirror();
+    }
+
+    void handleDeviceListChange() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (rebuilding_) return;
+        if (mirrorId_ == kAudioObjectUnknown) return;
+
+        // Check if our mirror's physical sub-device still exists
+        if (lastPhysicalOutput_ != kAudioObjectUnknown) {
+            std::string uid = getDeviceUID(lastPhysicalOutput_);
+            if (!uid.empty()) return; // Sub-device still exists, mirror is healthy
+        }
+
+        // The physical output device disappeared (headset disconnected, etc.)
+        // Find a new physical output to use
+        SULLA_LOG_WARN("Mirror", "Physical output device disappeared — rebuilding mirror");
+
+        // Destroy the broken mirror first so macOS picks a real device as default
+        destroyMirrorNoLock();
+
+        // Give macOS a moment to settle the default output, then rebuild
+        // The output change listener will fire and handle the rebuild
+        // But if the default lands on BlackHole, we need to force it
+        AudioDeviceID newDefault = getDefaultOutputDevice();
+        std::string newUID = getDeviceUID(newDefault);
+
+        if (newUID == kBlackHoleUID || newUID == kMirrorUID || newUID.empty()) {
+            // macOS fell back to BlackHole or nothing — find a real device
+            AudioDeviceID fallback = findFallbackOutputDevice();
+            if (fallback != kAudioObjectUnknown) {
+                setDefaultOutputDevice(fallback);
+                SULLA_LOG_INFO("Mirror", "Fell back to: " + getDeviceName(fallback));
+                lastPhysicalOutput_ = fallback;
+            }
+        } else {
+            lastPhysicalOutput_ = newDefault;
+            SULLA_LOG_INFO("Mirror", "macOS switched to: " + getDeviceName(newDefault));
+        }
+
         rebuildMirror();
     }
 
@@ -363,6 +440,64 @@ private:
             std::string uid = getDeviceUID(dev);
             if (uid == targetUID) return dev;
         }
+        return kAudioObjectUnknown;
+    }
+
+    /**
+     * Find a physical output device to fall back to when the current one disappears.
+     * Skips BlackHole, our mirror, and any device without output channels.
+     */
+    static AudioDeviceID findFallbackOutputDevice() {
+        AudioObjectPropertyAddress addr = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 size = 0;
+        AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &size);
+        int count = size / sizeof(AudioDeviceID);
+        std::vector<AudioDeviceID> devices(count);
+        AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &size, devices.data());
+
+        for (auto dev : devices) {
+            std::string uid = getDeviceUID(dev);
+            if (uid == kMirrorUID || uid == kBlackHoleUID || uid.empty()) continue;
+
+            // Check it has output channels
+            AudioObjectPropertyAddress outAddr = {
+                kAudioDevicePropertyStreamConfiguration,
+                kAudioObjectPropertyScopeOutput,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 bufSize = 0;
+            AudioObjectGetPropertyDataSize(dev, &outAddr, 0, nullptr, &bufSize);
+            if (bufSize > sizeof(AudioBufferList)) {
+                // Has output streams — check it's not a virtual/aggregate device
+                std::string name = getDeviceName(dev);
+                // Prefer built-in devices
+                if (name.find("Speaker") != std::string::npos ||
+                    name.find("Headphone") != std::string::npos ||
+                    name.find("Built-in") != std::string::npos ||
+                    name.find("MacBook") != std::string::npos) {
+                    return dev;
+                }
+            }
+        }
+
+        // No preferred device found — return first device with output channels
+        for (auto dev : devices) {
+            std::string uid = getDeviceUID(dev);
+            if (uid == kMirrorUID || uid == kBlackHoleUID || uid.empty()) continue;
+            AudioObjectPropertyAddress outAddr = {
+                kAudioDevicePropertyStreamConfiguration,
+                kAudioObjectPropertyScopeOutput,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 bufSize = 0;
+            AudioObjectGetPropertyDataSize(dev, &outAddr, 0, nullptr, &bufSize);
+            if (bufSize > sizeof(AudioBufferList)) return dev;
+        }
+
         return kAudioObjectUnknown;
     }
 
