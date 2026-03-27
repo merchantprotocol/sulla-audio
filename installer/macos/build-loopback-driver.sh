@@ -96,6 +96,9 @@ build_driver() {
         -target BlackHole \
         CONFIGURATION_BUILD_DIR="$build_dir" \
         PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+        CODE_SIGN_IDENTITY="" \
+        CODE_SIGNING_REQUIRED=NO \
+        CODE_SIGNING_ALLOWED=NO \
         GCC_PREPROCESSOR_DEFINITIONS='$(GCC_PREPROCESSOR_DEFINITIONS)
             kNumber_Of_Channels='"$CHANNELS"'
             kPlugIn_BundleID=\"'"$BUNDLE_ID"'\"
