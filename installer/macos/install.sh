@@ -163,8 +163,49 @@ if [ "$SKIP_BLACKHOLE" = false ]; then
     echo ""
 fi
 
-# 2. Install binary
-BINARY_SOURCE="${SCRIPT_DIR}/../../build/audio-driver"
+# 2. Build and install binary
+PROJECT_ROOT="${SCRIPT_DIR}/../.."
+BUILD_DIR="${PROJECT_ROOT}/build"
+BINARY_SOURCE="${BUILD_DIR}/audio-driver"
+
+if [ ! -f "$BINARY_SOURCE" ]; then
+    log "Building audio-driver from source..."
+
+    # Check for cmake
+    CMAKE_BIN=""
+    if command -v cmake &>/dev/null; then
+        CMAKE_BIN="cmake"
+    elif [ -x /opt/homebrew/bin/cmake ]; then
+        CMAKE_BIN="/opt/homebrew/bin/cmake"
+    elif [ -x /usr/local/bin/cmake ]; then
+        CMAKE_BIN="/usr/local/bin/cmake"
+    fi
+
+    if [ -z "$CMAKE_BIN" ]; then
+        warn "cmake not found. Attempting to install via Homebrew..."
+        REAL_USER="${SUDO_USER:-$USER}"
+        if command -v brew &>/dev/null; then
+            sudo -u "$REAL_USER" brew install cmake 2>/dev/null
+            CMAKE_BIN="$(sudo -u "$REAL_USER" brew --prefix)/bin/cmake"
+        fi
+    fi
+
+    if [ -z "$CMAKE_BIN" ] || [ ! -x "$CMAKE_BIN" ]; then
+        error "cmake is required to build audio-driver."
+        error "Install it: brew install cmake"
+    else
+        mkdir -p "$BUILD_DIR"
+        "$CMAKE_BIN" -S "$PROJECT_ROOT" -B "$BUILD_DIR" -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release </dev/null 2>&1 | tail -3
+        "$CMAKE_BIN" --build "$BUILD_DIR" --target audio-driver 2>&1 | tail -5
+
+        if [ -f "$BINARY_SOURCE" ]; then
+            log "Build successful."
+        else
+            error "Build failed. Check cmake output above."
+        fi
+    fi
+fi
+
 if [ -f "$BINARY_SOURCE" ]; then
     log "Installing binary to ${BINARY_DEST}..."
     mkdir -p "$(dirname "$BINARY_DEST")"
@@ -172,8 +213,7 @@ if [ -f "$BINARY_SOURCE" ]; then
     chmod 755 "$BINARY_DEST"
     log "Binary installed."
 else
-    warn "Binary not found at ${BINARY_SOURCE} — skipping."
-    warn "Build it first: cmake --build build"
+    warn "Binary not available — skipping install."
 fi
 
 # 3. Create config directory with local mode defaults
