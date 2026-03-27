@@ -3,10 +3,10 @@
 
 using namespace sulla;
 
-TEST(DriverConfig, DefaultIsGatewayMode) {
+TEST(DriverConfig, DefaultIsLocalMode) {
     DriverConfig cfg;
-    EXPECT_TRUE(cfg.isGatewayMode());
-    EXPECT_FALSE(cfg.isLocalMode());
+    EXPECT_FALSE(cfg.isGatewayMode());
+    EXPECT_TRUE(cfg.isLocalMode());
     EXPECT_TRUE(cfg.gatewayUrl.empty());
     EXPECT_TRUE(cfg.backendUrl.empty());
     EXPECT_TRUE(cfg.email.empty());
@@ -114,7 +114,7 @@ TEST(DriverConfig, DeserializeIgnoresCommentsAndHeaders) {
 
 TEST(DriverConfig, DeserializeEmptyString) {
     auto cfg = DriverConfig::deserialize("");
-    EXPECT_TRUE(cfg.isGatewayMode()); // Default
+    EXPECT_TRUE(cfg.isLocalMode()); // Default
     EXPECT_FALSE(cfg.hasGatewayConfig());
 }
 

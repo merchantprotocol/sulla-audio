@@ -1,19 +1,19 @@
 #!/bin/bash
 #
-# AudioDriver driver installer for macOS.
+# Audio Driver installer for macOS.
 #
 # Installs:
 #   1. BlackHole 2ch virtual audio device (external dependency, GPLv3)
-#   2. audio-driver-driver binary → /usr/local/bin/
+#   2. audio-driver binary → /usr/local/bin/
 #   3. Config directory → ~/Library/Application Support/AudioDriver/
 #
-# BlackHole is required on macOS for system audio loopback capture.
-# It is installed as a separate package — not bundled with audio-driver.
+# Default: local mode — no credentials, no gateway.
+# The driver listens on a local socket for desktop apps to connect.
 #
 # Usage:
 #   sudo ./install.sh
 #   sudo ./install.sh --uninstall
-#   sudo ./install.sh --skip-blackhole    # Skip BlackHole install
+#   sudo ./install.sh --skip-blackhole
 #
 
 set -e
@@ -23,7 +23,7 @@ BLACKHOLE_PKG_URL="https://existential.audio/downloads/BlackHole2ch-${BLACKHOLE_
 BLACKHOLE_PKG_ID="audio.existential.BlackHole2ch"
 BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c1988"
 
-BINARY_NAME="audio-driver-driver"
+BINARY_NAME="audio-driver"
 BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
 CONFIG_DIR="${HOME}/Library/Application Support/AudioDriver"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,15 +43,12 @@ info()  { echo -e "${CYAN}[audio-driver]${NC} $1"; }
 # ─── Check for BlackHole ─────────────────────────────────────
 
 blackhole_installed() {
-    # Check via pkgutil (package receipts)
     if pkgutil --pkg-info "${BLACKHOLE_PKG_ID}" &>/dev/null; then
         return 0
     fi
-    # Check via HAL plugin directory
     if [ -d "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver" ]; then
         return 0
     fi
-    # Check via system_profiler
     if system_profiler SPAudioDataType 2>/dev/null | grep -qi "BlackHole"; then
         return 0
     fi
@@ -69,10 +66,9 @@ install_blackhole() {
     info "Homepage: https://existential.audio/blackhole/"
     echo ""
 
-    # Try Homebrew first (preferred — handles updates)
+    # Try Homebrew first
     if command -v brew &>/dev/null; then
         log "Installing BlackHole 2ch via Homebrew..."
-        # Run brew as the real user, not root
         REAL_USER="${SUDO_USER:-$USER}"
         if sudo -u "$REAL_USER" brew install --cask blackhole-2ch 2>/dev/null; then
             log "BlackHole 2ch installed via Homebrew."
@@ -91,7 +87,6 @@ install_blackhole() {
         return 1
     fi
 
-    # Verify checksum
     local actual_sha
     actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
     if [ "$actual_sha" != "$BLACKHOLE_SHA256" ]; then
@@ -103,7 +98,6 @@ install_blackhole() {
     fi
     log "Checksum verified."
 
-    # Install
     log "Installing BlackHole 2ch..."
     if installer -pkg "$pkg_path" -target / 2>/dev/null; then
         log "BlackHole 2ch installed successfully."
@@ -121,7 +115,7 @@ install_blackhole() {
 # ─── Uninstall ────────────────────────────────────────────────
 
 if [ "$1" = "--uninstall" ]; then
-    log "Uninstalling AudioDriver..."
+    log "Uninstalling Audio Driver..."
 
     if [ -f "$BINARY_DEST" ]; then
         rm -f "$BINARY_DEST"
@@ -157,7 +151,7 @@ for arg in "$@"; do
     fi
 done
 
-log "Installing AudioDriver driver..."
+log "Installing Audio Driver..."
 echo ""
 
 # 1. Install BlackHole (external dependency)
@@ -170,19 +164,19 @@ if [ "$SKIP_BLACKHOLE" = false ]; then
 fi
 
 # 2. Install binary
-BINARY_SOURCE="${SCRIPT_DIR}/../../build/audio-driver-driver"
+BINARY_SOURCE="${SCRIPT_DIR}/../../build/audio-driver"
 if [ -f "$BINARY_SOURCE" ]; then
-    log "Installing driver binary to ${BINARY_DEST}..."
+    log "Installing binary to ${BINARY_DEST}..."
     mkdir -p "$(dirname "$BINARY_DEST")"
     cp "$BINARY_SOURCE" "$BINARY_DEST"
     chmod 755 "$BINARY_DEST"
-    log "Driver binary installed."
+    log "Binary installed."
 else
-    warn "Driver binary not found at ${BINARY_SOURCE} — skipping."
+    warn "Binary not found at ${BINARY_SOURCE} — skipping."
     warn "Build it first: cmake --build build"
 fi
 
-# 3. Create config directory
+# 3. Create config directory with local mode defaults
 REAL_HOME=$(eval echo "~${SUDO_USER:-$USER}")
 REAL_CONFIG="${REAL_HOME}/Library/Application Support/AudioDriver"
 if [ ! -d "$REAL_CONFIG" ]; then
@@ -192,18 +186,17 @@ if [ ! -d "$REAL_CONFIG" ]; then
 
     cat > "${REAL_CONFIG}/config.ini" << 'EOF'
 [mode]
-mode=gateway
+mode=local
 
 [auth]
 backend_url=
 email=
-# password is never saved — enter at runtime
 
 [gateway]
 url=
 
 [local]
-socket_path=
+socket_path=/tmp/audio-driver.sock
 port=0
 
 [audio]
@@ -221,7 +214,7 @@ log_level=info
 log_audio_diagnostics=true
 EOF
     chown "${SUDO_USER:-$USER}" "${REAL_CONFIG}/config.ini"
-    log "Default config written to ${REAL_CONFIG}/config.ini"
+    log "Default config: local mode (no credentials needed)"
 fi
 
 # 4. Restart coreaudiod to detect BlackHole
@@ -240,12 +233,10 @@ fi
 echo ""
 log "Installation complete!"
 echo ""
-log "Next steps:"
-log "  Gateway mode (standalone):"
-log "    audio-driver-driver --mode gateway --backend-url https://api.example.com --email you@example.com"
-log ""
-log "  Local mode (with Sulla Desktop):"
-log "    audio-driver-driver --mode local"
-log ""
-log "  List devices:"
-log "    audio-driver-driver --list-devices"
+log "The driver is ready in local mode — no credentials needed."
+log "Desktop apps can connect via /tmp/audio-driver.sock"
+echo ""
+log "Commands:"
+log "  audio-driver                      Start (local mode)"
+log "  audio-driver --list-devices       List audio devices"
+log "  audio-driver --configure          Set up gateway mode (credentials)"

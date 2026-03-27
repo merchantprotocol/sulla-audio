@@ -28,9 +28,9 @@ struct DriverConfig {
     // ── Mode ─────────────────────────────────────────────────
     enum class Mode {
         Gateway,  // Standalone: auth + stream directly to gateway
-        Local     // Sulla Desktop colocated: stream via local IPC, no auth
+        Local     // Desktop app colocated: stream via local IPC, no auth
     };
-    Mode mode = Mode::Gateway;
+    Mode mode = Mode::Local;
 
     // ── Auth (gateway mode only) ─────────────────────────────
     std::string backendUrl;      // REST API base, e.g. "https://api.example.com"

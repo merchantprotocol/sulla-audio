@@ -1,13 +1,13 @@
 @echo off
 REM
-REM AudioDriver driver installer for Windows.
+REM Audio Driver installer for Windows.
 REM
-REM Windows has native WASAPI loopback support — no virtual audio device needed.
-REM This installer just copies the driver binary and creates the config directory.
+REM Windows has native WASAPI loopback — no virtual audio device needed.
+REM Default: local mode — no credentials, no gateway.
 REM
 REM Installs:
-REM   1. audio-driver-driver.exe  → %ProgramFiles%\AudioDriver\
-REM   2. Config directory        → %APPDATA%\AudioDriver\
+REM   1. audio-driver.exe  → %ProgramFiles%\AudioDriver\
+REM   2. Config directory   → %APPDATA%\AudioDriver\
 REM
 REM Usage:
 REM   install.bat
@@ -18,10 +18,10 @@ setlocal enabledelayedexpansion
 
 set INSTALL_DIR=%ProgramFiles%\AudioDriver
 set CONFIG_DIR=%APPDATA%\AudioDriver
-set BINARY_NAME=audio-driver-driver.exe
+set BINARY_NAME=audio-driver.exe
 set SCRIPT_DIR=%~dp0
 
-echo [audio-driver] AudioDriver Driver Installer for Windows
+echo [audio-driver] Audio Driver Installer for Windows
 echo.
 
 REM ── Uninstall ──────────────────────────────────────────────
@@ -65,20 +65,18 @@ if exist "%BINARY_SOURCE%" (
     echo [audio-driver] Build first: cmake --build build --config Release
 )
 
-REM 3. Create config directory
+REM 3. Create config directory with local mode defaults
 if not exist "%CONFIG_DIR%" (
     mkdir "%CONFIG_DIR%"
     echo [audio-driver] Created config directory: %CONFIG_DIR%
 
-    REM Write default config
     (
         echo [mode]
-        echo mode=gateway
+        echo mode=local
         echo.
         echo [auth]
         echo backend_url=
         echo email=
-        echo # password is never saved — enter at runtime
         echo.
         echo [gateway]
         echo url=
@@ -101,22 +99,18 @@ if not exist "%CONFIG_DIR%" (
         echo log_level=info
         echo log_audio_diagnostics=true
     ) > "%CONFIG_DIR%\config.ini"
-    echo [audio-driver] Default config written to %CONFIG_DIR%\config.ini
+    echo [audio-driver] Default config: local mode (no credentials needed)
 )
 
 echo.
 echo [audio-driver] Installation complete!
 echo.
-echo [audio-driver] Next steps:
+echo [audio-driver] The driver is ready in local mode — no credentials needed.
 echo.
-echo   Gateway mode (standalone):
-echo     "%INSTALL_DIR%\%BINARY_NAME%" --mode gateway --backend-url https://api.example.com --email you@example.com
-echo.
-echo   Local mode (with Sulla Desktop):
-echo     "%INSTALL_DIR%\%BINARY_NAME%" --mode local
-echo.
-echo   List devices:
-echo     "%INSTALL_DIR%\%BINARY_NAME%" --list-devices
+echo [audio-driver] Commands:
+echo   "%INSTALL_DIR%\%BINARY_NAME%"                      Start (local mode)
+echo   "%INSTALL_DIR%\%BINARY_NAME%" --list-devices       List audio devices
+echo   "%INSTALL_DIR%\%BINARY_NAME%" --configure          Set up gateway mode
 
 :end
 endlocal
