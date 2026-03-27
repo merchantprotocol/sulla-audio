@@ -224,6 +224,13 @@ int runDriver(sulla::DriverConfig& config) {
         driver->login(password);
     }
 
+    // Check if startup failed (e.g. transport bind error)
+    if (driver->state() == sulla::DriverController::DriverState::Error) {
+        std::cerr << "Error: Driver failed to start. Check logs above.\n";
+        driver->stop();
+        return 1;
+    }
+
     // Run until signal
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);

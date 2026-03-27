@@ -49,8 +49,12 @@ public:
 
         socketPath_ = socketPath;
 
-        // Remove stale socket file
-        ::unlink(socketPath.c_str());
+        // Remove stale socket file — must succeed for bind() to work
+        if (::unlink(socketPath.c_str()) < 0 && errno != ENOENT) {
+            SULLA_LOG_WARN("Transport", "Could not remove stale socket "
+                + socketPath + ": " + std::string(strerror(errno))
+                + " — attempting bind anyway");
+        }
 
         serverFd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (serverFd_ < 0) {
