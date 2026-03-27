@@ -26,24 +26,26 @@ NC='\033[0m'
 log()   { echo -e "${GREEN}[sulla-audio]${NC} $1"; }
 error() { echo -e "${RED}[sulla-audio]${NC} $1" >&2; }
 
-# Clone the repo
+# Clone the repo (close stdin so git doesn't hang when piped from curl)
 log "Downloading sulla-audio..."
 rm -rf "$CLONE_DIR"
-git clone --depth 1 "$REPO_URL" "$CLONE_DIR" 2>/dev/null || {
-    error "Failed to clone ${REPO_URL}"
+git clone --depth 1 "$REPO_URL" "$CLONE_DIR" </dev/null
+if [ ! -d "$CLONE_DIR/installer" ]; then
+    error "Failed to clone repository."
     exit 1
-}
+fi
+log "Downloaded to ${CLONE_DIR}"
 
 OS="$(uname -s)"
 
 case "$OS" in
     Darwin)
         log "Detected macOS"
-        exec bash "${CLONE_DIR}/installer/macos/install.sh" "$@"
+        bash "${CLONE_DIR}/installer/macos/install.sh" "$@"
         ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
         log "Detected Windows"
-        exec cmd.exe /c "${CLONE_DIR}\\installer\\windows\\install.bat" "$@"
+        cmd.exe /c "${CLONE_DIR}\\installer\\windows\\install.bat" "$@"
         ;;
     Linux)
         error "Linux is not currently supported."
@@ -56,3 +58,6 @@ case "$OS" in
         exit 1
         ;;
 esac
+
+# Cleanup
+rm -rf "$CLONE_DIR"
