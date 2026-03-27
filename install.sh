@@ -63,4 +63,4 @@ case "$OS" in
         ;;
 esac
 
-log "Installed to ${CLONE_DIR}"
+log "Done."
