@@ -18,6 +18,10 @@
 #include "PlatformDetector.h"
 #include "Logger.h"
 
+#ifdef __APPLE__
+#include "AudioMirrorManager.h"
+#endif
+
 namespace sulla {
 
 /**
@@ -183,6 +187,12 @@ public:
 
         setState(DriverState::Connecting, "Selecting audio device...");
 
+#ifdef __APPLE__
+        if (!mirrorManager_.start()) {
+            SULLA_LOG_WARN("Mirror", "Audio mirror unavailable — speaker capture may be silent");
+        }
+#endif
+
         // Step 1: Device selection
         auto selection = deviceCtrl_->selectDevice(config_.preferredDevice);
         if (!selection.found) {
@@ -252,6 +262,14 @@ public:
         }
         SULLA_LOG_INFO("Local", "Local transport listening on " + config_.localSocketPath);
 
+#ifdef __APPLE__
+        // Start audio mirror — ensures system audio is routed to BlackHole
+        // regardless of which output device the user selects
+        if (!mirrorManager_.start()) {
+            SULLA_LOG_WARN("Mirror", "Audio mirror unavailable — speaker capture may be silent");
+        }
+#endif
+
         // Device selection
         auto selection = deviceCtrl_->selectDevice(config_.preferredDevice);
         if (!selection.found) {
@@ -276,6 +294,10 @@ public:
 
         if (speakerCapture_) speakerCapture_->stop();
         if (micCapture_) micCapture_->stop();
+
+#ifdef __APPLE__
+        mirrorManager_.stop();
+#endif
 
         if (config_.isGatewayMode()) {
             if (gatewayClient_) gatewayClient_->disconnectAudio();
@@ -303,6 +325,9 @@ private:
 
     DriverConfig    config_;
     AuthCredentials auth_;
+#ifdef __APPLE__
+    AudioMirrorManager mirrorManager_;
+#endif
     GatewaySession  session_;
     AudioDevice     selectedDevice_;
     DriverState     state_ = DriverState::Unconfigured;
