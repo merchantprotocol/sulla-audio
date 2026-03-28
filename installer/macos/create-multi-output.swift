@@ -15,7 +15,7 @@ import Foundation
 
 let kDeviceName = "Sulla Audio Mirror"
 let kDeviceUID  = "SullaAudioMirror_UID"
-let kLoopbackUID = "SullaLoopback2ch_UID"
+let kLoopbackUIDs = ["BlackHole2ch_UID", "SullaLoopback2ch_UID"]
 
 // MARK: - Helpers
 
@@ -107,7 +107,7 @@ func createMultiOutput() -> Bool {
     }
 
     // Don't create if default is already the loopback driver (would create a loop)
-    if defaultUID == kLoopbackUID {
+    if kLoopbackUIDs.contains(defaultUID) {
         fputs("Error: default output is already SullaLoopback. Set a physical output device first.\n", stderr)
         return false
     }
@@ -119,8 +119,16 @@ func createMultiOutput() -> Bool {
     }
 
     // Verify loopback driver exists
-    guard findDeviceByUID(kLoopbackUID) != nil else {
-        fputs("Error: SullaLoopback not found. Install it first.\n", stderr)
+    // Find whichever loopback driver is available
+    var activeLoopbackUID: String? = nil
+    for uid in kLoopbackUIDs {
+        if findDeviceByUID(uid) != nil {
+            activeLoopbackUID = uid
+            break
+        }
+    }
+    guard let loopbackUID = activeLoopbackUID else {
+        fputs("Error: No loopback driver found (tried BlackHole2ch, SullaLoopback2ch). Install one first.\n", stderr)
         return false
     }
 
@@ -133,7 +141,7 @@ func createMultiOutput() -> Bool {
         kAudioAggregateDeviceIsStackedKey as String: 1 as UInt32,
         kAudioAggregateDeviceSubDeviceListKey as String: [
             [kAudioSubDeviceUIDKey as String: defaultUID],
-            [kAudioSubDeviceUIDKey as String: kLoopbackUID],
+            [kAudioSubDeviceUIDKey as String: loopbackUID],
         ]
     ]
 
@@ -189,7 +197,7 @@ func removeMultiOutput() -> Bool {
             var uidSize = UInt32(MemoryLayout<CFString>.size)
             AudioObjectGetPropertyData(dev, &uidAddr, 0, nil, &uidSize, &uid)
             let uidStr = uid as String
-            if uidStr != kDeviceUID && uidStr != kLoopbackUID && !uidStr.isEmpty {
+            if uidStr != kDeviceUID && !kLoopbackUIDs.contains(uidStr) && !uidStr.isEmpty {
                 // Check it has output channels
                 var outputAddr = AudioObjectPropertyAddress(
                     mSelector: kAudioDevicePropertyStreamConfiguration,

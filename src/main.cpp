@@ -16,6 +16,7 @@
  *   audio-driver --device ID             # Preferred audio device
  */
 
+#include <cstdio>
 #include <sulla/DriverConfig.h>
 #include <sulla/DeviceController.h>
 #include <sulla/CaptureController.h>
@@ -259,6 +260,10 @@ int runDriver(sulla::DriverConfig& config) {
 // ─── Entry point ─────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // Line-buffer stdout/stderr so logs flush immediately when redirected to a file (launchd)
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+
     // Handle info-only flags before loading config or touching any resources
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];

@@ -7,6 +7,8 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include "Logger.h"
 
 namespace sulla {
@@ -29,12 +31,18 @@ class AudioMirrorManager {
 public:
     static constexpr const char* kMirrorName = "Sulla Audio Mirror";
     static constexpr const char* kMirrorUID  = "SullaAudioMirror_UID";
-    static constexpr const char* kLoopbackUID = "SullaLoopback2ch_UID";
+    static constexpr const char* kLoopbackUIDs[] = {
+        "BlackHole2ch_UID",       // Official BlackHole 2ch (signed, via Homebrew)
+        "SullaLoopback2ch_UID",   // Custom build (when signed with Developer ID)
+    };
 
     using DeviceChangedCallback = std::function<void(AudioDeviceID loopbackDeviceId)>;
 
     AudioMirrorManager() = default;
     ~AudioMirrorManager() { stop(); }
+
+    /** Get the UID that was actually matched at startup. */
+    const char* activeLoopbackUID() const { return activeLoopbackUID_; }
 
     /**
      * Start managing the audio mirror.
@@ -44,17 +52,34 @@ public:
     bool start() {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Find loopback driver
-        loopbackId_ = findDeviceByUID(kLoopbackUID);
+        // Find loopback driver — try SullaLoopback first, fall back to BlackHole
+        for (const char* uid : kLoopbackUIDs) {
+            loopbackId_ = findDeviceByUID(uid);
+            if (loopbackId_ != kAudioObjectUnknown) {
+                activeLoopbackUID_ = uid;
+                break;
+            }
+        }
         if (loopbackId_ == kAudioObjectUnknown) {
-            SULLA_LOG_ERROR("Mirror", "SullaLoopback not found — cannot create audio mirror");
+            SULLA_LOG_ERROR("Mirror", "No loopback driver found (tried SullaLoopback2ch, BlackHole2ch) — cannot create audio mirror");
             return false;
         }
-        SULLA_LOG_INFO("Mirror", "Found SullaLoopback (ID: " + std::to_string(loopbackId_) + ")");
+        SULLA_LOG_INFO("Mirror", "Found loopback driver '" + std::string(activeLoopbackUID_) + "' (ID: " + std::to_string(loopbackId_) + ")");
 
-        // Create the initial mirror
-        if (!rebuildMirror()) {
-            SULLA_LOG_WARN("Mirror", "Initial mirror creation failed — will retry on output change");
+        // Create the initial mirror (retry — CoreAudio may not be ready at boot)
+        bool mirrorOk = false;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            if (rebuildMirror()) {
+                mirrorOk = true;
+                break;
+            }
+            if (attempt < 4) {
+                SULLA_LOG_WARN("Mirror", "Mirror creation failed (attempt " + std::to_string(attempt + 1) + "/5), retrying in 2 seconds...");
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+        }
+        if (!mirrorOk) {
+            SULLA_LOG_WARN("Mirror", "All mirror creation attempts failed — will retry on output change");
         }
 
         // Install listener for default output changes
@@ -130,10 +155,19 @@ private:
     std::mutex mutex_;
     AudioDeviceID loopbackId_ = kAudioObjectUnknown;
     AudioDeviceID mirrorId_ = kAudioObjectUnknown;
+    const char* activeLoopbackUID_ = nullptr;
     AudioDeviceID lastPhysicalOutput_ = kAudioObjectUnknown;
     bool listening_ = false;
     bool rebuilding_ = false;
     DeviceChangedCallback deviceChangedCb_;
+
+    /** Check if a UID matches any known loopback driver. */
+    static bool isLoopbackUID(const std::string& uid) {
+        for (const char* known : kLoopbackUIDs) {
+            if (uid == known) return true;
+        }
+        return false;
+    }
 
     /**
      * CoreAudio callback — fires when the default output device changes.
@@ -178,7 +212,7 @@ private:
         if (currentUID == kMirrorUID) return;
 
         // If it's the loopback driver itself, don't mirror (would create a loop)
-        if (currentUID == kLoopbackUID) {
+        if (isLoopbackUID(currentUID)) {
             SULLA_LOG_WARN("Mirror", "Default output switched to loopback driver — skipping mirror rebuild");
             return;
         }
@@ -217,7 +251,7 @@ private:
         AudioDeviceID newDefault = getDefaultOutputDevice();
         std::string newUID = getDeviceUID(newDefault);
 
-        if (newUID == kLoopbackUID || newUID == kMirrorUID || newUID.empty()) {
+        if (isLoopbackUID(newUID) || newUID == kMirrorUID || newUID.empty()) {
             // macOS fell back to loopback driver or nothing — find a real device
             AudioDeviceID fallback = findFallbackOutputDevice();
             if (fallback != kAudioObjectUnknown) {
@@ -272,7 +306,7 @@ private:
                     lastPhysicalOutput_ = physicalOutput;
                 }
                 // Fall through to destroy + recreate below
-            } else if (uid == kLoopbackUID) {
+            } else if (isLoopbackUID(uid)) {
                 rebuilding_ = false;
                 return false;
             }
@@ -312,7 +346,7 @@ private:
 
         CFMutableDictionaryRef bhDict = CFDictionaryCreateMutable(
             kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFStringRef bhUIDRef = CFStringCreateWithCString(kCFAllocatorDefault, kLoopbackUID, kCFStringEncodingUTF8);
+        CFStringRef bhUIDRef = CFStringCreateWithCString(kCFAllocatorDefault, activeLoopbackUID_, kCFStringEncodingUTF8);
         CFDictionarySetValue(bhDict, CFSTR(kAudioSubDeviceUIDKey), bhUIDRef);
         CFArrayAppendValue(subDevices, bhDict);
         CFRelease(bhUIDRef);
@@ -472,7 +506,7 @@ private:
 
         for (auto sub : subDevices) {
             std::string uid = getDeviceUID(sub);
-            if (uid != kLoopbackUID && uid != kMirrorUID && !uid.empty()) {
+            if (!isLoopbackUID(uid) && uid != kMirrorUID && !uid.empty()) {
                 return sub;
             }
         }
@@ -516,7 +550,7 @@ private:
 
         for (auto dev : devices) {
             std::string uid = getDeviceUID(dev);
-            if (uid == kMirrorUID || uid == kLoopbackUID || uid.empty()) continue;
+            if (uid == kMirrorUID || isLoopbackUID(uid) || uid.empty()) continue;
 
             // Check it has output channels
             AudioObjectPropertyAddress outAddr = {
@@ -542,7 +576,7 @@ private:
         // No preferred device found — return first device with output channels
         for (auto dev : devices) {
             std::string uid = getDeviceUID(dev);
-            if (uid == kMirrorUID || uid == kLoopbackUID || uid.empty()) continue;
+            if (uid == kMirrorUID || isLoopbackUID(uid) || uid.empty()) continue;
             AudioObjectPropertyAddress outAddr = {
                 kAudioDevicePropertyStreamConfiguration,
                 kAudioObjectPropertyScopeOutput,

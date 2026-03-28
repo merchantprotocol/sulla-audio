@@ -5,12 +5,12 @@
 # Safe to run repeatedly — checks current state and only acts on
 # what's broken or missing. Running it again will fix itself.
 #
-# Downloads pre-built binaries from GitHub Releases. Falls back to
-# building from source if the download fails (requires Xcode + cmake).
+# Always builds audio-driver from source (requires Xcode + cmake).
+# Installs BlackHole 2ch loopback driver via signed pkg download.
 #
 # Installs:
-#   1. SullaLoopback virtual audio device (hidden from System Settings)
-#   2. audio-driver binary → /usr/local/bin/
+#   1. Loopback audio driver (BlackHole 2ch preferred, SullaLoopback fallback)
+#   2. audio-driver binary → /usr/local/bin/ (always built from source)
 #   3. Config directory → ~/Library/Application Support/AudioDriver/
 #   4. launchd service → auto-starts on boot
 #
@@ -18,7 +18,6 @@
 #   sudo ./install.sh
 #   sudo ./install.sh --uninstall
 #   sudo ./install.sh --skip-loopback
-#   sudo ./install.sh --from-source      # force build from source
 #
 
 set -euo pipefail
@@ -134,22 +133,130 @@ resolve_brew() {
     return 1
 }
 
-# ─── SullaLoopback driver ───────────────────────────────────
+# ─── Loopback audio driver ─────────────────────────────────
+#
+# The audio-driver needs a virtual loopback device to capture system audio.
+# Two drivers are supported (AudioMirrorManager tries both at runtime):
+#
+#   1. BlackHole 2ch  — official signed build (preferred, always loads on macOS)
+#   2. SullaLoopback  — custom build (requires Developer ID cert to load on Sequoia+)
+#
+# Install order: BlackHole pkg direct download → Homebrew → SullaLoopback fallbacks.
 
-loopback_installed() {
+BLACKHOLE_VERSION="0.6.1"
+BLACKHOLE_PKG_URL="https://existential.audio/downloads/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
+BLACKHOLE_PKG_ID="audio.existential.BlackHole2ch"
+BLACKHOLE_SHA256="c829afa041a9f6e1b369c01953c8f079740dd1f02421109855829edc0d3c1988"
+BLACKHOLE_HAL_PATH="/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver"
+
+loopback_device_active() {
+    # Check if a loopback device is actually visible to CoreAudio (not just files on disk).
+    # Unsigned HAL plug-ins won't load on macOS 15+, so file checks alone are unreliable.
+    system_profiler SPAudioDataType 2>/dev/null | grep -qiE "BlackHole 2ch|SullaLoopback"
+}
+
+any_loopback_installed() {
+    # First: is a loopback device actually active in CoreAudio?
+    if loopback_device_active; then
+        log "  (Loopback device is active in CoreAudio)"
+        return 0
+    fi
+
+    # BlackHole pkgutil receipt exists but device not active → needs coreaudiod restart
+    if pkgutil --pkg-info "${BLACKHOLE_PKG_ID}" &>/dev/null; then
+        if [ -d "$BLACKHOLE_HAL_PATH" ]; then
+            log "  (BlackHole 2ch installed via pkg but not yet active — will restart coreaudiod)"
+            return 0
+        fi
+    fi
+
+    # BlackHole files exist (e.g. from Homebrew) but device not active → coreaudiod restart
+    if [ -d "$BLACKHOLE_HAL_PATH" ]; then
+        log "  (BlackHole 2ch driver found at ${BLACKHOLE_HAL_PATH} — will restart coreaudiod)"
+        return 0
+    fi
+
+    # SullaLoopback files exist but NOT active — unsigned driver, can't trust it
     if [ -d "$LOOPBACK_HAL_PATH" ]; then
-        log "  (detected via HAL plugin directory)"
-        return 0
+        warn "  SullaLoopback files found at ${LOOPBACK_HAL_PATH} but driver is NOT loaded by CoreAudio."
+        warn "  This usually means the driver is unsigned (won't load on macOS 15 Sequoia+)."
+        warn "  Installing signed BlackHole 2ch instead..."
+        # Don't return 0 — fall through to install a working driver
     fi
-    if system_profiler SPAudioDataType 2>/dev/null | grep -qi "SullaLoopback"; then
-        log "  (detected via system_profiler)"
-        return 0
+
+    # Clean up stale Homebrew state: brew thinks it's installed but the driver is gone
+    local brew_bin
+    if brew_bin=$(resolve_brew 2>/dev/null); then
+        if sudo -u "$REAL_USER" "$brew_bin" list --cask blackhole-2ch &>/dev/null; then
+            warn "Homebrew reports blackhole-2ch as installed, but the driver is missing."
+            warn "Cleaning up stale Homebrew state..."
+            sudo -u "$REAL_USER" "$brew_bin" uninstall --cask blackhole-2ch --force 2>/dev/null || true
+        fi
     fi
+
     return 1
 }
 
+install_blackhole_direct() {
+    # Primary path: download the signed pkg and run installer.
+    # Works in curl|sudo bash (no TTY needed — we are already root).
+    log "Downloading BlackHole 2ch v${BLACKHOLE_VERSION}..."
+
+    local pkg_path="/tmp/BlackHole2ch-${BLACKHOLE_VERSION}.pkg"
+
+    if ! curl -fSL -o "$pkg_path" "$BLACKHOLE_PKG_URL"; then
+        error "Failed to download BlackHole from ${BLACKHOLE_PKG_URL}"
+        rm -f "$pkg_path"
+        return 1
+    fi
+
+    # Verify checksum
+    local actual_sha
+    actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
+    if [ "$actual_sha" != "$BLACKHOLE_SHA256" ]; then
+        error "Checksum mismatch for BlackHole package!"
+        error "Expected: ${BLACKHOLE_SHA256}"
+        error "Got:      ${actual_sha}"
+        rm -f "$pkg_path"
+        return 1
+    fi
+    log "Checksum verified."
+
+    log "Installing BlackHole 2ch..."
+    local installer_output
+    if installer_output=$(installer -pkg "$pkg_path" -target / 2>&1); then
+        log "BlackHole 2ch installed successfully."
+        rm -f "$pkg_path"
+        return 0
+    else
+        error "Failed to install BlackHole package:"
+        echo "$installer_output" | while IFS= read -r line; do error "  $line"; done
+        rm -f "$pkg_path"
+        return 1
+    fi
+}
+
+install_blackhole_from_brew() {
+    # Secondary path: Homebrew (only works in interactive shells).
+    local local_brew
+    if ! local_brew=$(resolve_brew); then
+        return 1
+    fi
+
+    log "Installing BlackHole 2ch via Homebrew..."
+    local brew_output
+    if brew_output=$(sudo -u "$REAL_USER" "$local_brew" install --cask blackhole-2ch 2>&1); then
+        log "BlackHole 2ch installed via Homebrew."
+        return 0
+    else
+        warn "Homebrew install failed:"
+        echo "$brew_output" | tail -5 | while IFS= read -r line; do warn "  $line"; done
+        return 1
+    fi
+}
+
 install_loopback_from_release() {
-    log "Downloading pre-built SullaLoopback driver..."
+    log "Downloading pre-built SullaLoopback driver from release..."
 
     local url
     url=$(get_release_asset_url "${LOOPBACK_DRIVER_NAME}.driver.tar.gz") || return 1
@@ -161,7 +268,6 @@ install_loopback_from_release() {
         return 1
     fi
 
-    # Extract to HAL directory
     if [ -d "$LOOPBACK_HAL_PATH" ]; then
         rm -rf "$LOOPBACK_HAL_PATH"
     fi
@@ -174,7 +280,13 @@ install_loopback_from_release() {
         return 1
     fi
 
+    # Correct ownership so coreaudiod will load it
+    chown -R root:wheel "$LOOPBACK_HAL_PATH"
     chmod -R 755 "$LOOPBACK_HAL_PATH"
+    # Strip quarantine / provenance attributes that block unsigned drivers
+    xattr -r -d com.apple.quarantine "$LOOPBACK_HAL_PATH" 2>/dev/null || true
+    xattr -r -d com.apple.provenance "$LOOPBACK_HAL_PATH" 2>/dev/null || true
+
     log "SullaLoopback driver installed from release."
     return 0
 }
@@ -182,7 +294,6 @@ install_loopback_from_release() {
 install_loopback_from_source() {
     local build_script="${SCRIPT_DIR}/build-loopback-driver.sh"
     if [ ! -f "$build_script" ]; then
-        error "build-loopback-driver.sh not found — cannot build from source."
         return 1
     fi
 
@@ -197,31 +308,44 @@ install_loopback_from_source() {
 }
 
 install_loopback() {
-    log "Checking for SullaLoopback driver..."
-    if loopback_installed; then
-        log "SullaLoopback driver is already installed."
+    log "Checking for loopback audio driver..."
+
+    if any_loopback_installed; then
+        log "Loopback audio driver is already installed."
         LOOPBACK_OK=true
         return 0
     fi
 
-    info "SullaLoopback is required for system audio loopback on macOS."
+    info "A loopback audio driver is required for system audio capture on macOS."
+    info "BlackHole is a third-party open source driver (GPLv3) by Existential Audio."
+    info "Homepage: https://existential.audio/blackhole/"
     echo ""
 
-    if [ "$FROM_SOURCE" = false ]; then
-        if install_loopback_from_release; then
-            LOOPBACK_OK=true
-            LOOPBACK_JUST_INSTALLED=true
-            return 0
-        fi
-        warn "Pre-built download unavailable. Falling back to source build..."
-    fi
-
-    if install_loopback_from_source; then
+    # 1. Direct pkg download (works in curl|sudo bash — primary path)
+    if install_blackhole_direct; then
         LOOPBACK_OK=true
         LOOPBACK_JUST_INSTALLED=true
         return 0
     fi
 
+    # 2. Homebrew (works in interactive shells)
+    warn "Direct download failed. Trying Homebrew..."
+    if install_blackhole_from_brew; then
+        LOOPBACK_OK=true
+        LOOPBACK_JUST_INSTALLED=true
+        return 0
+    fi
+
+    # 3. SullaLoopback from source (requires Xcode, unsigned — may not load on Sequoia+)
+    warn "BlackHole install failed. Falling back to SullaLoopback source build..."
+    if install_loopback_from_source; then
+        LOOPBACK_OK=true
+        LOOPBACK_JUST_INSTALLED=true
+        warn "SullaLoopback built from source (unsigned) — may require approval on macOS 15+."
+        return 0
+    fi
+
+    error "Install BlackHole manually: https://existential.audio/blackhole/"
     return 1
 }
 
@@ -334,47 +458,13 @@ install_binary_from_source() {
 }
 
 install_binary() {
-    # Check if already up to date (when installing from release, always update)
-    if [ "$FROM_SOURCE" = false ]; then
-        if install_binary_from_release; then
-            BINARY_OK=true
-            BINARY_UPDATED=true
-            return 0
-        fi
-        warn "Pre-built download unavailable. Falling back to source build..."
+    # Always rebuild from source — no cached artifacts, always tip of branch.
+    if ! install_binary_from_source; then
+        error "Source build failed. Cannot continue."
+        return 1
     fi
-
-    # Source build path
-    local project_root="${SCRIPT_DIR}/../.."
-    local build_dir="${project_root}/build"
-    local binary_source="${build_dir}/audio-driver"
-
-    if [ ! -f "$binary_source" ]; then
-        if ! install_binary_from_source; then
-            if [ -f "$BINARY_DEST" ] && [ -x "$BINARY_DEST" ]; then
-                warn "Build failed but existing binary at ${BINARY_DEST} is usable."
-                BINARY_OK=true
-                return 0
-            fi
-            error "No binary available. The service cannot start without it."
-            return 1
-        fi
-        BINARY_OK=true
-        BINARY_UPDATED=true
-        return 0
-    fi
-
-    # Binary already built locally — install it
-    if [ -f "$BINARY_DEST" ] && cmp -s "$binary_source" "$BINARY_DEST"; then
-        log "Binary at ${BINARY_DEST} is up to date."
-    else
-        log "Installing binary to ${BINARY_DEST}..."
-        mkdir -p "$(dirname "$BINARY_DEST")"
-        cp "$binary_source" "$BINARY_DEST"
-        chmod 755 "$BINARY_DEST"
-        log "Binary installed."
-        BINARY_UPDATED=true
-    fi
+    BINARY_OK=true
+    BINARY_UPDATED=true
 
     if [ ! -f "$BINARY_DEST" ] || [ ! -x "$BINARY_DEST" ]; then
         error "Binary installation failed."
@@ -391,10 +481,9 @@ if [ "${1:-}" = "--uninstall" ]; then
     log "Uninstalling Audio Driver..."
 
     # Stop and remove launchd service (check both old system daemon and new user agent)
-    local REAL_UID
-    REAL_UID=$(id -u "$REAL_USER")
+    UNINSTALL_UID=$(id -u "$REAL_USER")
     launchctl bootout system/"${PLIST_LABEL}" 2>/dev/null || true
-    sudo -u "$REAL_USER" launchctl bootout "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null || true
+    sudo -u "$REAL_USER" launchctl bootout "gui/${UNINSTALL_UID}/${PLIST_LABEL}" 2>/dev/null || true
     rm -f "$OLD_PLIST_PATH" "$PLIST_PATH"
     log "Service removed."
 
@@ -404,8 +493,8 @@ if [ "${1:-}" = "--uninstall" ]; then
     fi
 
     # Remove Multi-Output Device
-    local swift_src="${SCRIPT_DIR}/create-multi-output.swift"
-    local swift_bin="/tmp/sulla-create-multi-output"
+    swift_src="${SCRIPT_DIR}/create-multi-output.swift"
+    swift_bin="/tmp/sulla-create-multi-output"
     if [ -f "$swift_src" ]; then
         if swiftc -O "$swift_src" -o "$swift_bin" 2>/dev/null; then
             if "$swift_bin" --remove 2>&1; then
@@ -418,12 +507,31 @@ if [ "${1:-}" = "--uninstall" ]; then
     # Clean up socket
     rm -f /tmp/audio-driver.sock
 
-    # Remove SullaLoopback driver
+    # Remove loopback drivers
+    loopback_removed=false
     if [ -d "$LOOPBACK_HAL_PATH" ]; then
         rm -rf "$LOOPBACK_HAL_PATH"
+        log "SullaLoopback driver removed."
+        loopback_removed=true
+    fi
+
+    # Uninstall BlackHole via Homebrew if we installed it
+    local_brew=""
+    if local_brew=$(resolve_brew 2>/dev/null); then
+        if sudo -u "$REAL_USER" "$local_brew" list --cask blackhole-2ch &>/dev/null; then
+            log "Removing BlackHole 2ch via Homebrew..."
+            sudo -u "$REAL_USER" "$local_brew" uninstall --cask blackhole-2ch 2>&1 || true
+            loopback_removed=true
+        fi
+    elif [ -d "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver" ]; then
+        rm -rf "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver"
+        log "BlackHole 2ch driver removed."
+        loopback_removed=true
+    fi
+
+    if [ "$loopback_removed" = true ]; then
         launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
             killall coreaudiod 2>/dev/null || true
-        log "SullaLoopback driver removed."
     fi
 
     echo ""
@@ -442,22 +550,21 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 SKIP_LOOPBACK=false
-FROM_SOURCE=false
+FROM_SOURCE=true   # Always build from source — no cached release artifacts
 for arg in "$@"; do
     case "$arg" in
         --skip-loopback|--skip-blackhole) SKIP_LOOPBACK=true ;;
-        --from-source) FROM_SOURCE=true ;;
     esac
 done
 
 log "Installing Audio Driver..."
 echo ""
 
-# ─── Step 1: SullaLoopback driver ────────────────────────────
+# ─── Step 1: Loopback audio driver ───────────────────────────
 
 if [ "$SKIP_LOOPBACK" = false ]; then
     if ! install_loopback; then
-        warn "Continuing without SullaLoopback. System audio capture may not work."
+        warn "Continuing without loopback driver. System audio capture may not work."
     fi
     echo ""
 fi
@@ -512,21 +619,21 @@ fi
 # ─── Step 4: coreaudiod (only if loopback driver was just installed) ─
 
 if [ "$LOOPBACK_JUST_INSTALLED" = true ]; then
-    log "Restarting coreaudiod to detect SullaLoopback..."
+    log "Restarting coreaudiod to detect loopback driver..."
     launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>/dev/null || \
         killall coreaudiod 2>/dev/null || true
 
     tries=0
-    while [ $tries -lt 5 ]; do
+    while [ $tries -lt 10 ]; do
         sleep 1
-        if system_profiler SPAudioDataType 2>/dev/null | grep -qi "SullaLoopback"; then
-            log "SullaLoopback virtual audio device detected!"
+        if system_profiler SPAudioDataType 2>/dev/null | grep -qiE "SullaLoopback|BlackHole 2ch"; then
+            log "Loopback audio device detected!"
             break
         fi
         tries=$((tries + 1))
     done
-    if [ $tries -eq 5 ]; then
-        warn "SullaLoopback not yet visible. A reboot may be required."
+    if [ $tries -eq 10 ]; then
+        warn "Loopback device not yet visible. A reboot may be required."
     fi
 fi
 
@@ -716,11 +823,11 @@ echo "────────────────────────�
 FAILURES=0
 
 if [ "$LOOPBACK_OK" = true ]; then
-    log "  SullaLoopback .......... OK"
+    log "  Loopback driver ........ OK"
 elif [ "$SKIP_LOOPBACK" = true ]; then
-    warn "  SullaLoopback .......... SKIPPED"
+    warn "  Loopback driver ........ SKIPPED"
 else
-    error "  SullaLoopback .......... FAILED"
+    error "  Loopback driver ........ FAILED"
     FAILURES=$((FAILURES + 1))
 fi
 
