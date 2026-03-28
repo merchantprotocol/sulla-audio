@@ -268,6 +268,19 @@ public:
         if (!mirrorManager_.start()) {
             SULLA_LOG_WARN("Mirror", "Audio mirror unavailable — speaker capture may be silent");
         }
+
+        // Track client connections to gate the mirror watchdog
+        localTransport_->onStatus([this](bool connected, const std::string& detail) {
+            clientConnected_ = connected;
+            if (connected) {
+                SULLA_LOG_INFO("Driver", "Client connected — monitoring audio for silence");
+                silentChunkCount_ = 0;
+            } else {
+                SULLA_LOG_INFO("Driver", "All clients disconnected — stopping mirror watchdog");
+                mirrorManager_.stopWatchdog();
+                silentChunkCount_ = 0;
+            }
+        });
 #endif
 
         // Device selection
@@ -335,6 +348,26 @@ private:
 
     uint32_t speakerChunkCount_ = 0;
     uint32_t micChunkCount_ = 0;
+#ifdef __APPLE__
+    std::atomic<bool> clientConnected_{false};
+    std::atomic<uint32_t> silentChunkCount_{0};
+#endif
+
+    /**
+     * Check if a PCM chunk is silence (all samples below noise floor).
+     * Chunks are 16-bit signed int PCM (the CaptureController's target format).
+     */
+    static bool isChunkSilent(const std::vector<uint8_t>& raw) {
+        // 16-bit PCM: 2 bytes per sample. Threshold ~0.1% of full scale.
+        static constexpr int16_t kSilenceThreshold = 32;
+        const auto* samples = reinterpret_cast<const int16_t*>(raw.data());
+        size_t count = raw.size() / sizeof(int16_t);
+        for (size_t i = 0; i < count; ++i) {
+            int16_t s = samples[i];
+            if (s > kSilenceThreshold || s < -kSilenceThreshold) return false;
+        }
+        return true;
+    }
 
     void wireCapturesToGateway() {
         speakerCapture_->onChunk([this](const std::vector<uint8_t>& raw) {
@@ -376,6 +409,28 @@ private:
             if (config_.logAudioDiagnostics && (chunk.sequenceNum <= 5 || chunk.sequenceNum % 100 == 0)) {
                 SULLA_LOG_DEBUG("Capture", chunk.toString());
             }
+
+#ifdef __APPLE__
+            // Gate the mirror watchdog based on audio silence + client presence.
+            // Only burn CPU polling CoreAudio when a client needs audio and we're
+            // delivering silence (meaning macOS probably switched away from mirror).
+            if (clientConnected_) {
+                bool silent = isChunkSilent(raw);
+                if (silent) {
+                    uint32_t count = ++silentChunkCount_;
+                    if (count == AudioMirrorManager::kSilenceThresholdChunks) {
+                        SULLA_LOG_WARN("Driver", "Sustained silence detected with client connected — starting mirror watchdog");
+                        mirrorManager_.startWatchdog();
+                    }
+                } else {
+                    if (silentChunkCount_ >= AudioMirrorManager::kSilenceThresholdChunks) {
+                        SULLA_LOG_INFO("Driver", "Audio flowing again — stopping mirror watchdog");
+                        mirrorManager_.stopWatchdog();
+                    }
+                    silentChunkCount_ = 0;
+                }
+            }
+#endif
 
             localTransport_->sendChunk(chunk);
         });

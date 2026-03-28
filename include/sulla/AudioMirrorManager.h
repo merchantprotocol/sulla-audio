@@ -29,7 +29,7 @@ namespace sulla {
  */
 class AudioMirrorManager {
 public:
-    static constexpr const char* kMirrorName = "Sulla Audio Mirror";
+    static constexpr const char* kMirrorNameSuffix = " + LoopBack";
     static constexpr const char* kMirrorUID  = "SullaAudioMirror_UID";
     static constexpr const char* kLoopbackUIDs[] = {
         "BlackHole2ch_UID",       // Official BlackHole 2ch (signed, via Homebrew)
@@ -37,6 +37,9 @@ public:
     };
 
     using DeviceChangedCallback = std::function<void(AudioDeviceID loopbackDeviceId)>;
+
+    static constexpr int kWatchdogIntervalSeconds = 3;
+    static constexpr int kSilenceThresholdChunks  = 8; // ~2s of silence before watchdog kicks in
 
     AudioMirrorManager() = default;
     ~AudioMirrorManager() { stop(); }
@@ -114,9 +117,46 @@ public:
     }
 
     /**
+     * Start the watchdog thread. Called by DriverController when a client
+     * is connected and sustained silence is detected — indicates macOS
+     * may have silently switched away from our private mirror.
+     *
+     * Safe to call multiple times; only starts one thread.
+     */
+    void startWatchdog() {
+        if (watchdogRunning_) return;
+        watchdogRunning_ = true;
+        watchdogThread_ = std::thread([this]() {
+            SULLA_LOG_INFO("Mirror", "Watchdog started — checking mirror every " + std::to_string(kWatchdogIntervalSeconds) + "s");
+            while (watchdogRunning_) {
+                std::this_thread::sleep_for(std::chrono::seconds(kWatchdogIntervalSeconds));
+                if (!watchdogRunning_) break;
+                checkMirrorHealth();
+            }
+            SULLA_LOG_DEBUG("Mirror", "Watchdog stopped");
+        });
+    }
+
+    /**
+     * Stop the watchdog thread. Called when audio is confirmed flowing
+     * or all clients have disconnected.
+     */
+    void stopWatchdog() {
+        if (!watchdogRunning_) return;
+        watchdogRunning_ = false;
+        if (watchdogThread_.joinable()) {
+            watchdogThread_.join();
+        }
+        SULLA_LOG_DEBUG("Mirror", "Watchdog stopped by controller");
+    }
+
+    /**
      * Stop managing — remove listener, destroy mirror, restore original output.
      */
     void stop() {
+        // Stop watchdog first (outside mutex — thread may be waiting on lock)
+        stopWatchdog();
+
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (listening_) {
@@ -160,6 +200,8 @@ private:
     bool listening_ = false;
     bool rebuilding_ = false;
     DeviceChangedCallback deviceChangedCb_;
+    std::atomic<bool> watchdogRunning_{false};
+    std::thread watchdogThread_;
 
     /** Check if a UID matches any known loopback driver. */
     static bool isLoopbackUID(const std::string& uid) {
@@ -268,6 +310,39 @@ private:
     }
 
     /**
+     * Watchdog health check — called periodically to catch cases where
+     * macOS silently switches away from our private mirror without
+     * firing a property change callback (sleep/wake, other apps, etc.).
+     *
+     * If the default output is no longer our mirror, treat the current
+     * default as the user's intended device and rebuild the mirror around it.
+     */
+    void checkMirrorHealth() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (rebuilding_ || !listening_) return;
+
+        AudioDeviceID currentDefault = getDefaultOutputDevice();
+        if (currentDefault == kAudioObjectUnknown) return;
+
+        std::string currentUID = getDeviceUID(currentDefault);
+
+        // Mirror is still the default — all good
+        if (currentUID == kMirrorUID) return;
+
+        // Default switched to the loopback driver itself — skip (would loop)
+        if (isLoopbackUID(currentUID)) return;
+
+        // macOS silently switched away from the mirror.
+        // Treat the current default as the user's chosen physical device.
+        std::string deviceName = getDeviceName(currentDefault);
+        SULLA_LOG_WARN("Mirror", "Watchdog: default output is no longer mirror — now: " + deviceName + " (ID: " + std::to_string(currentDefault) + "). Rebuilding.");
+
+        lastPhysicalOutput_ = currentDefault;
+        rebuildMirror();
+    }
+
+    /**
      * Destroy old mirror (if any), create a new one with the current
      * physical output + loopback driver, set it as default.
      */
@@ -331,7 +406,8 @@ private:
             return false;
         }
 
-        SULLA_LOG_INFO("Mirror", "Creating mirror: " + physicalName + " + SullaLoopback");
+        std::string mirrorName = physicalName + kMirrorNameSuffix;
+        SULLA_LOG_INFO("Mirror", "Creating mirror: " + mirrorName);
 
         // Build sub-device list: physical output first (main), loopback second
         CFMutableArrayRef subDevices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
@@ -356,7 +432,7 @@ private:
         CFMutableDictionaryRef desc = CFDictionaryCreateMutable(
             kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
-        CFStringRef nameRef = CFStringCreateWithCString(kCFAllocatorDefault, kMirrorName, kCFStringEncodingUTF8);
+        CFStringRef nameRef = CFStringCreateWithCString(kCFAllocatorDefault, mirrorName.c_str(), kCFStringEncodingUTF8);
         CFStringRef uidRef = CFStringCreateWithCString(kCFAllocatorDefault, kMirrorUID, kCFStringEncodingUTF8);
 
         CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceNameKey), nameRef);
@@ -368,11 +444,11 @@ private:
         CFNumberRef stackedRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &stacked);
         CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsStackedKey), stackedRef);
 
-        // Hide the aggregate device from System Settings and Audio MIDI Setup
-        int isPrivate = 1;
-        CFNumberRef privateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &isPrivate);
-        CFDictionarySetValue(desc, CFSTR(kAudioAggregateDeviceIsPrivateKey), privateRef);
-        CFRelease(privateRef);
+        // NOTE: Do NOT set kAudioAggregateDeviceIsPrivateKey. macOS actively
+        // overrides private aggregate devices as the default output, causing an
+        // infinite rebuild loop. The mirror is visible in System Settings as
+        // "Sulla Audio Mirror" — if the user selects a different device,
+        // handleOutputChange() rebuilds the mirror wrapping their new choice.
 
         // Set the physical output as the master sub-device for volume control.
         // Without this, macOS disables the volume keys and slider because
