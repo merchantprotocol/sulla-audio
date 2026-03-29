@@ -20,6 +20,7 @@
 
 #ifdef __APPLE__
 #include "AudioMirrorManager.h"
+#include "MediaKeyListener.h"
 #endif
 
 namespace sulla {
@@ -191,6 +192,7 @@ public:
         if (!mirrorManager_.start()) {
             SULLA_LOG_WARN("Mirror", "Audio mirror unavailable — speaker capture may be silent");
         }
+        startMediaKeyListener();
 #endif
 
         // Step 1: Device selection
@@ -268,6 +270,7 @@ public:
         if (!mirrorManager_.start()) {
             SULLA_LOG_WARN("Mirror", "Audio mirror unavailable — speaker capture may be silent");
         }
+        startMediaKeyListener();
 
         // Track client connections to gate the mirror watchdog
         localTransport_->onStatus([this](bool connected, const std::string& detail) {
@@ -309,6 +312,7 @@ public:
         if (micCapture_) micCapture_->stop();
 
 #ifdef __APPLE__
+        mediaKeyListener_.stop();
         mirrorManager_.stop();
 #endif
 
@@ -328,6 +332,28 @@ public:
     const DriverConfig& config() const { return config_; }
     const AuthCredentials& auth() const { return auth_; }
 
+    // ─── Volume control ─────────────────────────────────────
+    // These control the physical output device that the mirror wraps.
+    // macOS disables volume UI for multi-output aggregate devices,
+    // so these provide direct access to the underlying device's volume.
+
+#ifdef __APPLE__
+    /** Get volume (0.0–1.0) of the wrapped physical output, or -1 on error. */
+    float getVolume() const { return mirrorManager_.getVolume(); }
+
+    /** Set volume (0.0–1.0) of the wrapped physical output. */
+    bool setVolume(float volume) { return mirrorManager_.setVolume(volume); }
+
+    /** Adjust volume by delta (e.g. +0.0625 = one notch up). Returns new volume or -1. */
+    float adjustVolume(float delta) { return mirrorManager_.adjustVolume(delta); }
+
+    /** Check mute state: 1=muted, 0=unmuted, -1=error. */
+    int isMuted() const { return mirrorManager_.isMuted(); }
+
+    /** Set mute state. */
+    bool setMuted(bool mute) { return mirrorManager_.setMuted(mute); }
+#endif
+
 private:
     std::unique_ptr<DeviceController>  deviceCtrl_;
     std::unique_ptr<CaptureController> speakerCapture_;
@@ -340,6 +366,7 @@ private:
     AuthCredentials auth_;
 #ifdef __APPLE__
     AudioMirrorManager mirrorManager_;
+    MediaKeyListener mediaKeyListener_;
 #endif
     GatewaySession  session_;
     AudioDevice     selectedDevice_;
@@ -368,6 +395,27 @@ private:
         }
         return true;
     }
+
+#ifdef __APPLE__
+    void startMediaKeyListener() {
+        mediaKeyListener_.onVolumeAdjust([this](float delta) {
+            float newVol = mirrorManager_.adjustVolume(delta);
+            if (newVol >= 0.0f) {
+                SULLA_LOG_DEBUG("Driver", "Volume key → " + std::to_string(newVol));
+            }
+        });
+        mediaKeyListener_.onMuteToggle([this]() {
+            int muted = mirrorManager_.isMuted();
+            if (muted >= 0) {
+                mirrorManager_.setMuted(!muted);
+                SULLA_LOG_DEBUG("Driver", std::string("Mute key → ") + (muted ? "unmuted" : "muted"));
+            }
+        });
+        if (!mediaKeyListener_.start()) {
+            SULLA_LOG_WARN("Driver", "Media key listener unavailable — keyboard volume keys won't work");
+        }
+    }
+#endif
 
     void wireCapturesToGateway() {
         speakerCapture_->onChunk([this](const std::vector<uint8_t>& raw) {

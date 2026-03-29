@@ -3,12 +3,15 @@
 #ifdef __APPLE__
 
 #include <CoreAudio/CoreAudio.h>
+#include <AudioToolbox/AudioServices.h>
 #include <functional>
 #include <string>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <fstream>
+#include <sys/stat.h>
 #include "Logger.h"
 
 namespace sulla {
@@ -43,6 +46,67 @@ public:
 
     AudioMirrorManager() = default;
     ~AudioMirrorManager() { stop(); }
+
+    // ─── Enable / Disable (flag file) ──────────────────────────
+
+    /** Path to the flag file that controls whether the mirror is enabled. */
+    static std::string enabledFlagPath() {
+#if defined(__APPLE__)
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/Library/Application Support/AudioDriver/mirror-enabled";
+#else
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/.config/audio-driver/mirror-enabled";
+#endif
+    }
+
+    /** Check if the mirror is enabled (flag file exists). Enabled by default if no flag file. */
+    static bool isEnabled() {
+        struct stat st;
+        std::string disabledPath = disabledFlagPath();
+        // Mirror is enabled unless a "mirror-disabled" flag exists
+        return stat(disabledPath.c_str(), &st) != 0;
+    }
+
+    /** Enable the mirror — remove the disabled flag and create/restore the aggregate. */
+    static void enable() {
+        ::unlink(disabledFlagPath().c_str());
+        SULLA_LOG_INFO("Mirror", "Enabled — mirror will be created on next start/rebuild");
+    }
+
+    /** Disable the mirror — set the disabled flag and destroy any existing aggregate. */
+    static void disable() {
+        // Create config dir if needed
+        std::string dir;
+#if defined(__APPLE__)
+        const char* home = std::getenv("HOME");
+        dir = std::string(home ? home : "/tmp") + "/Library/Application Support/AudioDriver";
+#else
+        const char* home = std::getenv("HOME");
+        dir = std::string(home ? home : "/tmp") + "/.config/audio-driver";
+#endif
+        ::mkdir(dir.c_str(), 0755);
+
+        // Write disabled flag
+        std::ofstream f(disabledFlagPath());
+        f << "disabled\n";
+        f.close();
+
+        // Destroy any existing mirror aggregate so the physical device becomes default
+        AudioDeviceID orphan = findDeviceByUID(kMirrorUID);
+        if (orphan != kAudioObjectUnknown) {
+            // Restore default output to the physical sub-device first
+            AudioDeviceID physical = getFirstNonBlackholeSubDevice(orphan);
+            if (physical != kAudioObjectUnknown) {
+                setDefaultOutputDevice(physical);
+                SULLA_LOG_INFO("Mirror", "Restored default output to: " + getDeviceName(physical));
+            }
+            AudioHardwareDestroyAggregateDevice(orphan);
+            SULLA_LOG_INFO("Mirror", "Destroyed mirror aggregate");
+        }
+
+        SULLA_LOG_INFO("Mirror", "Disabled — volume keys will work normally");
+    }
 
     /** Get the UID that was actually matched at startup. */
     const char* activeLoopbackUID() const { return activeLoopbackUID_; }
@@ -190,6 +254,167 @@ public:
 
     /** Get the current mirror device ID. */
     AudioDeviceID mirrorDeviceId() const { return mirrorId_; }
+
+    /** Get the physical output device ID that the mirror wraps. */
+    AudioDeviceID physicalOutputDeviceId() const { return lastPhysicalOutput_; }
+
+    /**
+     * Get the volume of the wrapped physical output device.
+     * Returns a value between 0.0 (muted) and 1.0 (max), or -1.0 on error.
+     *
+     * macOS disables the volume slider for multi-output aggregate devices,
+     * so this method reads volume directly from the physical sub-device.
+     */
+    float getVolume() const {
+        AudioDeviceID device = lastPhysicalOutput_;
+        if (device == kAudioObjectUnknown) {
+            SULLA_LOG_WARN("Mirror", "getVolume: no physical output device");
+            return -1.0f;
+        }
+
+        Float32 volume = 0.0f;
+        UInt32 size = sizeof(volume);
+
+        // Use AudioHardwareService API — this is how macOS controls volume
+        // for built-in speakers. AudioObject API doesn't work for these devices.
+        AudioObjectPropertyAddress addr = {
+            kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        OSStatus status = AudioHardwareServiceGetPropertyData(device, &addr, 0, nullptr, &size, &volume);
+        if (status == noErr) {
+            SULLA_LOG_DEBUG("Mirror", "getVolume: " + std::to_string(volume) + " via Service API");
+            return volume;
+        }
+        SULLA_LOG_DEBUG("Mirror", "getVolume: Service API failed (" + std::to_string(status) + "), trying HAL API");
+
+        // Fall back to HAL API for external audio devices
+        addr.mSelector = kAudioDevicePropertyVolumeScalar;
+        for (UInt32 ch : {0u, 1u}) {
+            addr.mElement = ch;
+            status = AudioObjectGetPropertyData(device, &addr, 0, nullptr, &size, &volume);
+            if (status == noErr) {
+                SULLA_LOG_DEBUG("Mirror", "getVolume: " + std::to_string(volume) + " via HAL ch" + std::to_string(ch));
+                return volume;
+            }
+        }
+
+        SULLA_LOG_WARN("Mirror", "getVolume: all methods failed on device "
+            + std::to_string(device) + " (" + getDeviceName(device) + ")");
+        return -1.0f;
+    }
+
+    /**
+     * Set the volume of the wrapped physical output device.
+     * @param volume Value between 0.0 (muted) and 1.0 (max).
+     * @return true on success.
+     */
+    bool setVolume(float volume) {
+        AudioDeviceID device = lastPhysicalOutput_;
+        if (device == kAudioObjectUnknown) {
+            SULLA_LOG_WARN("Mirror", "setVolume: no physical output device");
+            return false;
+        }
+        if (volume < 0.0f) volume = 0.0f;
+        if (volume > 1.0f) volume = 1.0f;
+
+        Float32 vol = volume;
+
+        // Use AudioHardwareService API — this is what macOS volume slider uses
+        AudioObjectPropertyAddress addr = {
+            kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        OSStatus status = AudioHardwareServiceSetPropertyData(device, &addr, 0, nullptr, sizeof(vol), &vol);
+        if (status == noErr) {
+            SULLA_LOG_DEBUG("Mirror", "setVolume: " + std::to_string(volume) + " via Service API");
+            return true;
+        }
+        SULLA_LOG_DEBUG("Mirror", "setVolume: Service API failed (" + std::to_string(status) + "), trying HAL API");
+
+        // Fall back to HAL API per-channel for external devices
+        addr.mSelector = kAudioDevicePropertyVolumeScalar;
+        bool anySet = false;
+        for (UInt32 ch = 0; ch <= 2; ++ch) {
+            addr.mElement = ch;
+            Boolean settable = false;
+            if (AudioObjectHasProperty(device, &addr) &&
+                AudioObjectIsPropertySettable(device, &addr, &settable) == noErr &&
+                settable) {
+                status = AudioObjectSetPropertyData(device, &addr, 0, nullptr, sizeof(vol), &vol);
+                if (status == noErr) {
+                    anySet = true;
+                    SULLA_LOG_DEBUG("Mirror", "setVolume ch" + std::to_string(ch) + ": " + std::to_string(volume));
+                }
+            }
+        }
+
+        if (!anySet) {
+            SULLA_LOG_WARN("Mirror", "setVolume: all methods failed on device "
+                + std::to_string(device) + " (" + getDeviceName(device) + ")");
+        }
+        return anySet;
+    }
+
+    /**
+     * Adjust volume by a relative amount (e.g., +0.0625 to increase, -0.0625 to decrease).
+     * @return The new volume level, or -1.0 on error.
+     */
+    float adjustVolume(float delta) {
+        float current = getVolume();
+        if (current < 0.0f) {
+            SULLA_LOG_WARN("Mirror", "adjustVolume: getVolume failed");
+            return -1.0f;
+        }
+        float newVol = current + delta;
+        if (newVol < 0.0f) newVol = 0.0f;
+        if (newVol > 1.0f) newVol = 1.0f;
+        SULLA_LOG_INFO("Mirror", "Volume: " + std::to_string(current) + " → " + std::to_string(newVol));
+        if (setVolume(newVol)) return newVol;
+        return -1.0f;
+    }
+
+    /**
+     * Check if the wrapped physical device is muted.
+     * @return 1 = muted, 0 = not muted, -1 = error/unknown.
+     */
+    int isMuted() const {
+        AudioDeviceID device = lastPhysicalOutput_;
+        if (device == kAudioObjectUnknown) return -1;
+
+        AudioObjectPropertyAddress addr = {
+            kAudioDevicePropertyMute,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 muted = 0;
+        UInt32 size = sizeof(muted);
+        OSStatus status = AudioObjectGetPropertyData(device, &addr, 0, nullptr, &size, &muted);
+        if (status != noErr) return -1;
+        return (int)muted;
+    }
+
+    /**
+     * Set the mute state of the wrapped physical device.
+     */
+    bool setMuted(bool mute) {
+        AudioDeviceID device = lastPhysicalOutput_;
+        if (device == kAudioObjectUnknown) return false;
+
+        AudioObjectPropertyAddress addr = {
+            kAudioDevicePropertyMute,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 muted = mute ? 1 : 0;
+        OSStatus status = AudioObjectSetPropertyData(device, &addr, 0, nullptr, sizeof(muted), &muted);
+        if (status == noErr) {
+            SULLA_LOG_DEBUG("Mirror", std::string(mute ? "Muted" : "Unmuted") + " physical output");
+        }
+        return status == noErr;
+    }
 
 private:
     std::mutex mutex_;
@@ -347,6 +572,13 @@ private:
      * physical output + loopback driver, set it as default.
      */
     bool rebuildMirror() {
+        // Check if mirror is disabled by user
+        if (!isEnabled()) {
+            SULLA_LOG_DEBUG("Mirror", "Mirror is disabled — skipping rebuild");
+            rebuilding_ = false;
+            return false;
+        }
+
         rebuilding_ = true;
 
         // Determine the physical output device to mirror
@@ -513,7 +745,8 @@ private:
         mirrorId_ = kAudioObjectUnknown;
     }
 
-    // ─── CoreAudio helpers ──────────────────────────────────────
+public:
+    // ─── CoreAudio helpers (public for CLI volume commands) ─────
 
     static AudioDeviceID getDefaultOutputDevice() {
         AudioObjectPropertyAddress addr = {
@@ -677,6 +910,17 @@ private:
             sizeof(deviceId), &deviceId
         );
         return status == noErr;
+    }
+
+private:
+    static std::string disabledFlagPath() {
+#if defined(__APPLE__)
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/Library/Application Support/AudioDriver/mirror-disabled";
+#else
+        const char* home = std::getenv("HOME");
+        return std::string(home ? home : "/tmp") + "/.config/audio-driver/mirror-disabled";
+#endif
     }
 };
 

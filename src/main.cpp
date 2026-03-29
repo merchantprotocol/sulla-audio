@@ -292,9 +292,165 @@ int main(int argc, char* argv[]) {
                       << "  audio-driver --log-level LEVEL      trace|debug|info|warn|error\n"
                       << "  audio-driver --no-mic               Disable mic capture\n"
                       << "  audio-driver --no-auto-start        Don't auto-start\n"
+                      << "\nVolume control:\n"
+                      << "  audio-driver --get-volume           Print current volume (0.0–1.0)\n"
+                      << "  audio-driver --set-volume VALUE     Set volume (0.0–1.0)\n"
+                      << "  audio-driver --volume-up            Increase volume by one notch\n"
+                      << "  audio-driver --volume-down          Decrease volume by one notch\n"
+                      << "  audio-driver --mute                 Mute the output\n"
+                      << "  audio-driver --unmute               Unmute the output\n"
+                      << "\nMirror control:\n"
+                      << "  audio-driver --enable               Enable audio mirror (aggregate device)\n"
+                      << "  audio-driver --disable              Disable mirror (restore normal volume)\n"
+                      << "  audio-driver --status               Show mirror status\n"
                       << "\nConfig: " << sulla::DriverConfig::configFilePath() << "\n";
             return 0;
         }
+
+#ifdef __APPLE__
+        if (arg == "--enable") {
+            sulla::AudioMirrorManager::enable();
+            // Create the mirror immediately
+            sulla::AudioMirrorManager mgr;
+            if (mgr.start()) {
+                std::cout << "Mirror enabled — audio capture active, volume keys disabled\n";
+            } else {
+                std::cout << "Mirror enabled — will activate when loopback driver is available\n";
+            }
+            // Detach so mirror stays alive (don't call stop/destructor)
+            // Actually for CLI we just enable the flag; the daemon handles the rest
+            mgr.stop();
+            return 0;
+        }
+        if (arg == "--disable") {
+            sulla::AudioMirrorManager::disable();
+            std::cout << "Mirror disabled — volume keys restored\n";
+            return 0;
+        }
+        if (arg == "--status") {
+            bool enabled = sulla::AudioMirrorManager::isEnabled();
+            AudioDeviceID mirror = sulla::AudioMirrorManager::findDeviceByUID(
+                sulla::AudioMirrorManager::kMirrorUID);
+            bool mirrorActive = (mirror != kAudioObjectUnknown);
+            AudioDeviceID defOut = sulla::AudioMirrorManager::getDefaultOutputDevice();
+            std::string defName = sulla::AudioMirrorManager::getDeviceName(defOut);
+
+            std::cout << "Mirror:  " << (enabled ? "enabled" : "disabled") << "\n"
+                      << "Active:  " << (mirrorActive ? "yes" : "no") << "\n"
+                      << "Output:  " << defName << "\n";
+
+            if (mirrorActive) {
+                AudioDeviceID physical = sulla::AudioMirrorManager::getFirstNonBlackholeSubDevice(mirror);
+                if (physical != kAudioObjectUnknown) {
+                    std::cout << "Wrapped: " << sulla::AudioMirrorManager::getDeviceName(physical) << "\n";
+                }
+            }
+            return 0;
+        }
+
+        // Volume CLI commands operate directly on the physical output device.
+        // They do NOT create/destroy mirrors — safe to run while the driver daemon is active.
+        if (arg == "--get-volume" || arg == "--set-volume" || arg == "--volume-up" ||
+            arg == "--volume-down" || arg == "--mute" || arg == "--unmute") {
+
+            // Find the physical output device:
+            // If a mirror is active, extract the physical sub-device from it.
+            // Otherwise, use the current default output.
+            AudioDeviceID physicalDevice = kAudioObjectUnknown;
+            AudioDeviceID defaultOut = sulla::AudioMirrorManager::getDefaultOutputDevice();
+            std::string defaultUID = sulla::AudioMirrorManager::getDeviceUID(defaultOut);
+
+            if (defaultUID == sulla::AudioMirrorManager::kMirrorUID) {
+                // Mirror is active — find the physical sub-device inside it
+                physicalDevice = sulla::AudioMirrorManager::getFirstNonBlackholeSubDevice(defaultOut);
+            }
+            if (physicalDevice == kAudioObjectUnknown) {
+                physicalDevice = defaultOut;
+            }
+
+            if (physicalDevice == kAudioObjectUnknown) {
+                std::cerr << "Error: No output device found\n";
+                return 1;
+            }
+
+            // Helper lambdas that operate on the physical device directly
+            auto getVol = [&]() -> float {
+                Float32 volume = 0.0f;
+                UInt32 size = sizeof(volume);
+                AudioObjectPropertyAddress addr = {
+                    kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+                    kAudioObjectPropertyScopeOutput,
+                    kAudioObjectPropertyElementMain
+                };
+                if (AudioHardwareServiceGetPropertyData(physicalDevice, &addr, 0, nullptr, &size, &volume) == noErr)
+                    return volume;
+                addr.mSelector = kAudioDevicePropertyVolumeScalar;
+                addr.mElement = 1;
+                if (AudioObjectGetPropertyData(physicalDevice, &addr, 0, nullptr, &size, &volume) == noErr)
+                    return volume;
+                return -1.0f;
+            };
+
+            auto setVol = [&](float v) -> bool {
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                Float32 vol = v;
+                AudioObjectPropertyAddress addr = {
+                    kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+                    kAudioObjectPropertyScopeOutput,
+                    kAudioObjectPropertyElementMain
+                };
+                return AudioHardwareServiceSetPropertyData(physicalDevice, &addr, 0, nullptr, sizeof(vol), &vol) == noErr;
+            };
+
+            if (arg == "--get-volume") {
+                float vol = getVol();
+                if (vol < 0.0f) { std::cerr << "Error: Could not read volume\n"; return 1; }
+                std::cout << vol << "\n";
+                return 0;
+            }
+            if (arg == "--set-volume" && i + 1 < argc) {
+                float val = std::stof(argv[++i]);
+                if (!setVol(val)) { std::cerr << "Error: Could not set volume\n"; return 1; }
+                std::cout << "Volume set to " << val << "\n";
+                return 0;
+            }
+            if (arg == "--volume-up") {
+                float cur = getVol();
+                if (cur < 0.0f) { std::cerr << "Error: Could not read volume\n"; return 1; }
+                float newVol = std::min(cur + 0.0625f, 1.0f);
+                if (!setVol(newVol)) { std::cerr << "Error: Could not set volume\n"; return 1; }
+                std::cout << newVol << "\n";
+                return 0;
+            }
+            if (arg == "--volume-down") {
+                float cur = getVol();
+                if (cur < 0.0f) { std::cerr << "Error: Could not read volume\n"; return 1; }
+                float newVol = std::max(cur - 0.0625f, 0.0f);
+                if (!setVol(newVol)) { std::cerr << "Error: Could not set volume\n"; return 1; }
+                std::cout << newVol << "\n";
+                return 0;
+            }
+            if (arg == "--mute") {
+                AudioObjectPropertyAddress addr = { kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+                UInt32 muted = 1;
+                if (AudioObjectSetPropertyData(physicalDevice, &addr, 0, nullptr, sizeof(muted), &muted) != noErr) {
+                    std::cerr << "Error: Could not mute\n"; return 1;
+                }
+                std::cout << "Muted\n";
+                return 0;
+            }
+            if (arg == "--unmute") {
+                AudioObjectPropertyAddress addr = { kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+                UInt32 muted = 0;
+                if (AudioObjectSetPropertyData(physicalDevice, &addr, 0, nullptr, sizeof(muted), &muted) != noErr) {
+                    std::cerr << "Error: Could not unmute\n"; return 1;
+                }
+                std::cout << "Unmuted\n";
+                return 0;
+            }
+        }
+#endif
     }
 
     auto config = loadConfig();
