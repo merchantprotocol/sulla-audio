@@ -400,18 +400,32 @@ resolve_cmake() {
     warn "cmake not found. Attempting to install via Homebrew..."
     local local_brew=""
     if local_brew=$(resolve_brew); then
+        # Run brew install as the real user (Homebrew refuses to run as root)
         if sudo -u "$REAL_USER" "$local_brew" install cmake 2>&1; then
-            local installed_cmake="$(dirname "$local_brew")/cmake"
-            if [ -x "$installed_cmake" ]; then
-                echo "$installed_cmake"
-                return 0
-            fi
-            installed_cmake="$("$local_brew" --prefix)/bin/cmake"
-            if [ -x "$installed_cmake" ]; then
-                echo "$installed_cmake"
-                return 0
-            fi
+            log "Homebrew cmake install completed — resolving path..."
+        else
+            warn "brew install cmake exited with an error — checking if cmake is available anyway..."
         fi
+
+        # Re-check all known paths after install (brew may have linked it anywhere)
+        local post_candidates=(
+            "$("$local_brew" --prefix 2>/dev/null)/bin/cmake"
+            "/opt/homebrew/bin/cmake"
+            "/usr/local/bin/cmake"
+        )
+        local post_user_cmake
+        post_user_cmake=$(sudo -u "$REAL_USER" bash -lc 'command -v cmake' 2>/dev/null || true)
+        if [ -n "$post_user_cmake" ]; then
+            post_candidates+=("$post_user_cmake")
+        fi
+
+        for candidate in "${post_candidates[@]}"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+                log "Found cmake at $candidate after brew install"
+                echo "$candidate"
+                return 0
+            fi
+        done
     fi
 
     return 1
